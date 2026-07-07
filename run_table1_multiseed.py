@@ -1,18 +1,23 @@
 """Run Table 1 dataset experiments across multiple seeds and plot variation.
 
-This wrapper runs, for seven seeds by default:
+This wrapper runs, for the chosen ``--architecture``:
 
-    python <analysis-script> --mode dataset --output-dir <seed_output> --seed <seed>
+    python <harness>.py --mode dataset --output-dir <seed_output> --seed <seed>
 
-where ``<analysis-script>`` is selected by ``--architecture``:
+for seven seeds by default. Each seed writes to its own directory so results are
+not overwritten. After the runs finish, the script combines the Table 1 CSVs and
+creates scatter plots for every numeric metric.
 
-    gpt2  ->  intervention_analysis.py       (dataset_analysis/)
-    opt   ->  intervention_analysis_opt.py   (dataset_analysis_opt/)
-    neo   ->  intervention_analysis_neo.py   (dataset_analysis_neo/)
+``--architecture`` selects which intervention harness to drive and which output
+subdirectory to read back:
 
-Each seed writes to its own directory so results are not overwritten. After the
-runs finish, the script combines the Table 1 CSVs and creates scatter plots for
-every numeric metric.
+    gpt2  → intervention_analysis.py       (results/.../dataset_analysis/)
+    opt   → intervention_analysis_opt.py   (results/.../dataset_analysis_opt/)
+    neo   -> intervention_analysis_neo.py  (results/.../dataset_analysis_neo/)
+    qwen  -> intervention_analysis_qwen.py (results/.../dataset_analysis_qwen/)
+
+All harnesses share the same Table 1 CSV schema, so aggregation and plotting
+are architecture-agnostic below.
 """
 
 from __future__ import annotations
@@ -31,18 +36,30 @@ import pandas as pd
 
 DEFAULT_SEEDS = [0, 1, 2, 3, 4, 5, 6]
 
-# Per-architecture routing: (analysis script, dataset-analysis output subdir).
-ARCH_CONFIG = {
-    "gpt2": ("intervention_analysis.py",     "dataset_analysis"),
-    "opt":  ("intervention_analysis_opt.py", "dataset_analysis_opt"),
-    "neo":  ("intervention_analysis_neo.py", "dataset_analysis_neo"),
+# Per-architecture harness script and the dataset-analysis subdirectory it writes.
+ARCHITECTURES = {
+    "gpt2": {
+        "script": "intervention_analysis.py",
+        "dataset_dir": "dataset_analysis",
+        "default_model": "gpt2",
+    },
+    "opt": {
+        "script": "intervention_analysis_opt.py",
+        "dataset_dir": "dataset_analysis_opt",
+        "default_model": "facebook/opt-125m",
+    },
+    "neo": {
+        "script": "intervention_analysis_neo.py",
+        "dataset_dir": "dataset_analysis_neo",
+        "default_model": "EleutherAI/gpt-neo-125m",
+    },
+    "qwen": {
+        "script": "intervention_analysis_qwen.py",
+        "dataset_dir": "dataset_analysis_qwen",
+        "default_model": "Qwen/Qwen2.5-0.5B",
+    },
 }
-# Default HF model per architecture, used when --model is not given.
-ARCH_DEFAULT_MODEL = {
-    "gpt2": "gpt2",
-    "opt":  "facebook/opt-125m",
-    "neo":  "EleutherAI/gpt-neo-125m",
-}
+DEFAULT_ARCHITECTURE = "gpt2"
 
 
 def parse_seeds(value: str) -> list[int]:
@@ -70,7 +87,7 @@ def safe_model_tag(model_name: str) -> str:
 
 
 def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
-    script = ARCH_CONFIG[args.architecture][0]
+    script = ARCHITECTURES[args.architecture]["script"]
     cmd = [
         args.python,
         script,
@@ -87,6 +104,9 @@ def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
         cmd.extend(["--sample-size", str(args.sample_size)])
     if args.cut_length is not None:
         cmd.extend(["--cut-length", str(args.cut_length)])
+    # --dtype only exists on the Qwen harness; forward it there when requested.
+    if args.architecture == "qwen" and args.dtype is not None:
+        cmd.extend(["--dtype", args.dtype])
 
     print("\n" + "=" * 80)
     print(f"Seed {seed}: {' '.join(cmd)}")
@@ -242,6 +262,14 @@ def main() -> None:
         description="Run Table 1 dataset analysis seven times and scatter-plot metrics."
     )
     parser.add_argument(
+        "--architecture",
+        choices=sorted(ARCHITECTURES),
+        default=DEFAULT_ARCHITECTURE,
+        help="Which intervention harness to drive: 'gpt2' (intervention_analysis.py), "
+             "'opt' (intervention_analysis_opt.py), 'neo' (intervention_analysis_neo.py), "
+             "or 'qwen' (intervention_analysis_qwen.py). Default: gpt2.",
+    )
+    parser.add_argument(
         "--seeds",
         type=parse_seeds,
         default=DEFAULT_SEEDS,
@@ -254,14 +282,6 @@ def main() -> None:
         help="Root results directory. Default: results",
     )
     parser.add_argument(
-        "--architecture",
-        choices=list(ARCH_CONFIG),
-        default="gpt2",
-        help="Which analysis script to drive: gpt2 (intervention_analysis.py), "
-             "opt (intervention_analysis_opt.py), or neo (intervention_analysis_neo.py). "
-             "Default: gpt2",
-    )
-    parser.add_argument(
         "--experiment-name",
         default="table1_multiseed",
         help="Subdirectory under --output-dir for multiseed runs.",
@@ -271,25 +291,32 @@ def main() -> None:
         "--model",
         dest="model_name",
         default=None,
-        help="Hugging Face model name or local model path. Defaults to the "
-             "architecture's base model (gpt2 / facebook/opt-125m / EleutherAI/gpt-neo-125m).",
+        help="Hugging Face model name or local path. Defaults to the chosen "
+             "architecture's base model.",
     )
     parser.add_argument(
         "--python",
         default=sys.executable,
-        help="Python executable used to run intervention_analysis.py.",
+        help="Python executable used to run the intervention harness.",
     )
     parser.add_argument(
         "--sample-size",
         type=int,
         default=None,
-        help="Optional override forwarded to intervention_analysis.py.",
+        help="Optional override forwarded to the intervention harness.",
     )
     parser.add_argument(
         "--cut-length",
         type=int,
         default=None,
-        help="Optional override forwarded to intervention_analysis.py.",
+        help="Optional override forwarded to the intervention harness.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16", "auto"],
+        default=None,
+        help="Model dtype, forwarded to the Qwen harness only (ignored for gpt2/opt). "
+             "Larger Qwen2.5 checkpoints (7B/14B) typically need float16/bfloat16.",
     )
     parser.add_argument(
         "--skip-existing",
@@ -303,21 +330,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    dataset_dir = ARCH_CONFIG[args.architecture][1]
-    default_model = ARCH_DEFAULT_MODEL[args.architecture]
+    architecture = ARCHITECTURES[args.architecture]
+    dataset_dir = architecture["dataset_dir"]
     if args.model_name is None:
-        args.model_name = default_model
+        args.model_name = architecture["default_model"]
 
-    # Auto-name the run directory so different architectures/models never collide.
-    # gpt2 keeps its original naming for backward compatibility.
     if args.experiment_name == "table1_multiseed":
-        if args.architecture == "gpt2":
-            if args.model_name != "gpt2":
-                args.experiment_name = f"table1_multiseed_{safe_model_tag(args.model_name)}"
-        else:
-            args.experiment_name = (
-                f"table1_multiseed_{args.architecture}_{safe_model_tag(args.model_name)}"
-            )
+        parts = ["table1_multiseed"]
+        if args.architecture != "gpt2":
+            parts.append(args.architecture)
+        if args.model_name != "gpt2":
+            parts.append(safe_model_tag(args.model_name))
+        args.experiment_name = "_".join(parts)
 
     root = args.output_dir / args.experiment_name
     root.mkdir(parents=True, exist_ok=True)
