@@ -64,32 +64,60 @@ Outputs:
 python intervention_analysis.py --mode dataset --output-dir results
 ```
 
-Supported GPT-2-family model variants:
-
-```bash
-python intervention_analysis.py --mode dataset --output-dir results --model gpt2
-python intervention_analysis.py --mode dataset --output-dir results --model distilgpt2
-python intervention_analysis.py --mode dataset --output-dir results --model gpt2-medium
-python intervention_analysis.py --mode dataset --output-dir results --model gpt2-large
-python intervention_analysis.py --mode dataset --output-dir results --model gpt2-xl
-```
-
-The intervention code uses GPT-2-specific internals, so model families such as
-OPT and GPT-Neo are not supported by this script without additional adapters.
-
 Outputs:
 - `results/dataset_analysis/bos_attention_summary_mid_layers.txt` → **Table 1**
 - `results/dataset_analysis/bos_attention_summary_mid_layers.csv`
 
-Multiseed Table 1 run:
+### Table 1 (OPT) — Cross-Architecture Replication
+
+`intervention_analysis_opt.py` reruns the exact Table 1 intervention suite on
+Meta's OPT models. OPT is the natural cross-architecture test because it keeps the
+two ingredients the sink circuit depends on: a learned **query bias** (`q_proj.bias`)
+and **learned absolute positional embeddings** (`embed_positions`). `facebook/opt-125m`
+is a structural twin of GPT-2 small (12 layers, 12 heads, hidden 768, pre-LayerNorm),
+so the metric and layer range (4–11) transfer directly.
 
 ```bash
-python run_table1_multiseed.py
+# opt-125m (default) — GPT-2-small twin
+python intervention_analysis_opt.py --mode dataset --model-name facebook/opt-125m --output-dir results
+
+# Larger OPT sizes (all pre-LayerNorm)
+python intervention_analysis_opt.py --mode dataset --model-name facebook/opt-1.3b --output-dir results
+python intervention_analysis_opt.py --mode dataset --model-name facebook/opt-2.7b --output-dir results
 ```
 
-By default this runs seeds `0,1,2,3,4,5,6`, writing each run under
-`results/table1_multiseed/seed_*/dataset_analysis/`. Combined CSVs and scatter
-plots are written under `results/table1_multiseed/aggregate/`.
+Outputs:
+- `results/dataset_analysis_opt/bos_attention_summary_mid_layers.txt` → **Table 1 (OPT)**
+- `results/dataset_analysis_opt/bos_attention_summary_mid_layers.csv`
+- `results/dataset_analysis_opt/bos_attention_stats_{by_dataset,overall}.csv`
+
+Multiseed OPT Table 1 runs for seeds `0,1,2`:
+
+```bash
+# opt-125m (default)
+python run_table1_multiseed.py --architecture opt --model facebook/opt-125m
+
+# opt-1.3b
+python run_table1_multiseed.py --architecture opt --model facebook/opt-1.3b
+
+# opt-2.7b
+python run_table1_multiseed.py --architecture opt --model facebook/opt-2.7b
+```
+
+Each seed writes to a separate directory under
+`results/table1_multiseed_opt_<model>/seed_*/dataset_analysis_opt/`. Combined
+CSVs and scatter plots are written under that run's `aggregate/` directory.
+
+Sentence-mode heatmap grids (the OPT analog of **Fig 5**):
+
+```bash
+python intervention_analysis_opt.py --mode sentence --model-name facebook/opt-125m --output-dir results
+# → results/sentence_analysis_opt/layer_*_avg.png
+```
+
+> **Note:** `facebook/opt-350m` uses post-LayerNorm and projects the word-embedding
+> dimension, so it is not directly comparable to the pre-LayerNorm circuit and is
+> rejected at load time. Use `opt-125m`, `opt-1.3b`, or `opt-2.7b`.
 
 ### Figure 7 (appendix) — Massive Activations in EPE_1
 
