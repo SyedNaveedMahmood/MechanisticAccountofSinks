@@ -1,12 +1,18 @@
 """Run Table 1 dataset experiments across multiple seeds and plot variation.
 
-This wrapper runs:
+This wrapper runs, for seven seeds by default:
 
-    python intervention_analysis.py --mode dataset --output-dir <seed_output> --seed <seed>
+    python <analysis-script> --mode dataset --output-dir <seed_output> --seed <seed>
 
-for seven seeds by default. Each seed writes to its own directory so results are
-not overwritten. After the runs finish, the script combines the Table 1 CSVs and
-creates scatter plots for every numeric metric.
+where ``<analysis-script>`` is selected by ``--architecture``:
+
+    gpt2  ->  intervention_analysis.py       (dataset_analysis/)
+    opt   ->  intervention_analysis_opt.py   (dataset_analysis_opt/)
+    neo   ->  intervention_analysis_neo.py   (dataset_analysis_neo/)
+
+Each seed writes to its own directory so results are not overwritten. After the
+runs finish, the script combines the Table 1 CSVs and creates scatter plots for
+every numeric metric.
 """
 
 from __future__ import annotations
@@ -24,7 +30,19 @@ import pandas as pd
 
 
 DEFAULT_SEEDS = [0, 1, 2, 3, 4, 5, 6]
-DATASET_ANALYSIS_DIR = "dataset_analysis"
+
+# Per-architecture routing: (analysis script, dataset-analysis output subdir).
+ARCH_CONFIG = {
+    "gpt2": ("intervention_analysis.py",     "dataset_analysis"),
+    "opt":  ("intervention_analysis_opt.py", "dataset_analysis_opt"),
+    "neo":  ("intervention_analysis_neo.py", "dataset_analysis_neo"),
+}
+# Default HF model per architecture, used when --model is not given.
+ARCH_DEFAULT_MODEL = {
+    "gpt2": "gpt2",
+    "opt":  "facebook/opt-125m",
+    "neo":  "EleutherAI/gpt-neo-125m",
+}
 
 
 def parse_seeds(value: str) -> list[int]:
@@ -52,16 +70,17 @@ def safe_model_tag(model_name: str) -> str:
 
 
 def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
+    script = ARCH_CONFIG[args.architecture][0]
     cmd = [
         args.python,
-        "intervention_analysis.py",
+        script,
         "--mode",
         "dataset",
         "--output-dir",
         str(out_dir),
         "--seed",
         str(seed),
-        "--model",
+        "--model-name",
         args.model_name,
     ]
     if args.sample_size is not None:
@@ -75,8 +94,8 @@ def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
-def read_seed_results(root: Path, seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    analysis_dir = seed_dir(root, seed) / DATASET_ANALYSIS_DIR
+def read_seed_results(root: Path, seed: int, dataset_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    analysis_dir = seed_dir(root, seed) / dataset_dir
     overall_path = analysis_dir / "bos_attention_stats_overall.csv"
     by_dataset_path = analysis_dir / "bos_attention_stats_by_dataset.csv"
 
@@ -113,14 +132,14 @@ def add_relative_metric(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def write_combined_csvs(root: Path, seeds: list[int]) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
+def write_combined_csvs(root: Path, seeds: list[int], dataset_dir: str) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
     aggregate_dir = root / "aggregate"
     aggregate_dir.mkdir(parents=True, exist_ok=True)
 
     overall_frames = []
     by_dataset_frames = []
     for seed in seeds:
-        overall, by_dataset = read_seed_results(root, seed)
+        overall, by_dataset = read_seed_results(root, seed, dataset_dir)
         overall_frames.append(overall)
         by_dataset_frames.append(by_dataset)
 
@@ -235,6 +254,14 @@ def main() -> None:
         help="Root results directory. Default: results",
     )
     parser.add_argument(
+        "--architecture",
+        choices=list(ARCH_CONFIG),
+        default="gpt2",
+        help="Which analysis script to drive: gpt2 (intervention_analysis.py), "
+             "opt (intervention_analysis_opt.py), or neo (intervention_analysis_neo.py). "
+             "Default: gpt2",
+    )
+    parser.add_argument(
         "--experiment-name",
         default="table1_multiseed",
         help="Subdirectory under --output-dir for multiseed runs.",
@@ -243,8 +270,9 @@ def main() -> None:
         "--model-name",
         "--model",
         dest="model_name",
-        default="gpt2",
-        help="Hugging Face GPT-2-family model name or local model path.",
+        default=None,
+        help="Hugging Face model name or local model path. Defaults to the "
+             "architecture's base model (gpt2 / facebook/opt-125m / EleutherAI/gpt-neo-125m).",
     )
     parser.add_argument(
         "--python",
@@ -275,8 +303,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.experiment_name == "table1_multiseed" and args.model_name != "gpt2":
-        args.experiment_name = f"table1_multiseed_{safe_model_tag(args.model_name)}"
+    dataset_dir = ARCH_CONFIG[args.architecture][1]
+    default_model = ARCH_DEFAULT_MODEL[args.architecture]
+    if args.model_name is None:
+        args.model_name = default_model
+
+    # Auto-name the run directory so different architectures/models never collide.
+    # gpt2 keeps its original naming for backward compatibility.
+    if args.experiment_name == "table1_multiseed":
+        if args.architecture == "gpt2":
+            if args.model_name != "gpt2":
+                args.experiment_name = f"table1_multiseed_{safe_model_tag(args.model_name)}"
+        else:
+            args.experiment_name = (
+                f"table1_multiseed_{args.architecture}_{safe_model_tag(args.model_name)}"
+            )
 
     root = args.output_dir / args.experiment_name
     root.mkdir(parents=True, exist_ok=True)
@@ -284,13 +325,13 @@ def main() -> None:
     if not args.plot_only:
         for seed in args.seeds:
             out_dir = seed_dir(root, seed)
-            overall_csv = out_dir / DATASET_ANALYSIS_DIR / "bos_attention_stats_overall.csv"
+            overall_csv = out_dir / dataset_dir / "bos_attention_stats_overall.csv"
             if args.skip_existing and overall_csv.exists():
                 print(f"Seed {seed}: found {overall_csv}; skipping.")
                 continue
             run_seed(args, seed, out_dir)
 
-    overall, by_dataset, aggregate_dir = write_combined_csvs(root, args.seeds)
+    overall, by_dataset, aggregate_dir = write_combined_csvs(root, args.seeds, dataset_dir)
     make_plots(overall, by_dataset, aggregate_dir)
 
     print("\nDone.")

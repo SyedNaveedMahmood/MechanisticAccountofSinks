@@ -119,6 +119,63 @@ python intervention_analysis_opt.py --mode sentence --model-name facebook/opt-12
 > dimension, so it is not directly comparable to the pre-LayerNorm circuit and is
 > rejected at load time. Use `opt-125m`, `opt-1.3b`, or `opt-2.7b`.
 
+### Table 1 (GPT-Neo) — Cross-Architecture Replication
+
+`intervention_analysis_neo.py` reruns the exact Table 1 intervention suite on
+EleutherAI's GPT-Neo models. GPT-Neo keeps the **learned absolute positional
+embeddings** the sink circuit relies on (a `wpe` table, exactly like GPT-2) but
+**drops the learned query bias** (`q_proj` is `bias=False`) and computes attention
+**without** the `1/sqrt(d)` scaling. `EleutherAI/gpt-neo-125m` is a structural twin
+of GPT-2 small (12 layers, 12 heads, hidden 768, pre-LayerNorm), so the metric and
+layer range (4–11) transfer directly.
+
+```bash
+# gpt-neo-125m (default) — GPT-2-small twin
+python intervention_analysis_neo.py --mode dataset --model-name EleutherAI/gpt-neo-125m --output-dir results
+
+# Larger GPT-Neo sizes
+python intervention_analysis_neo.py --mode dataset --model-name EleutherAI/gpt-neo-1.3B --output-dir results
+python intervention_analysis_neo.py --mode dataset --model-name EleutherAI/gpt-neo-2.7B --output-dir results
+```
+
+Outputs:
+- `results/dataset_analysis_neo/bos_attention_summary_mid_layers.txt` → **Table 1 (GPT-Neo)**
+- `results/dataset_analysis_neo/bos_attention_summary_mid_layers.csv`
+- `results/dataset_analysis_neo/bos_attention_stats_{by_dataset,overall}.csv`
+
+Multiseed GPT-Neo Table 1 runs (default seeds `0,1,2,3,4,5,6`; pass `--seeds 0,1,2`
+for a lighter run):
+
+```bash
+# gpt-neo-125m
+python run_table1_multiseed.py --architecture neo --model EleutherAI/gpt-neo-125m
+
+# gpt-neo-1.3B
+python run_table1_multiseed.py --architecture neo --model EleutherAI/gpt-neo-1.3B
+
+# gpt-neo-2.7B
+python run_table1_multiseed.py --architecture neo --model EleutherAI/gpt-neo-2.7B
+```
+
+Each seed writes to a separate directory under
+`results/table1_multiseed_neo_<model>/seed_*/dataset_analysis_neo/`. Combined
+CSVs and scatter plots are written under that run's `aggregate/` directory.
+
+Sentence-mode heatmap grids (the GPT-Neo analog of **Fig 5**):
+
+```bash
+python intervention_analysis_neo.py --mode sentence --model-name EleutherAI/gpt-neo-125m --output-dir results
+# → results/sentence_analysis_neo/layer_*_avg.png
+```
+
+> **Note:** GPT-Neo has **no query bias**, so intervention **(b) No Query Bias** is a
+> structural no-op and matches the baseline **(a)**; GPT-Neo does keep learned absolute
+> position embeddings, so (c)–(e), (h), and (i) remain meaningful. The fixed mid range
+> (layers 4–11) is calibrated for the 12-layer `gpt-neo-125m`; `gpt-neo-1.3B` (24 layers)
+> and `gpt-neo-2.7B` (32 layers) reuse it for comparability, and the `all_layers` summary
+> is written alongside for the full-depth view.
+
+
 ### Figure 7 (appendix) — Massive Activations in EPE_1
 
 ```bash
