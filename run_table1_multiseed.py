@@ -1,12 +1,22 @@
 """Run Table 1 dataset experiments across multiple seeds and plot variation.
 
-This wrapper runs:
+This wrapper runs, for the chosen ``--architecture``:
 
-    python intervention_analysis.py --mode dataset --output-dir <seed_output> --seed <seed>
+    python <harness>.py --mode dataset --output-dir <seed_output> --seed <seed>
 
 for seven seeds by default. Each seed writes to its own directory so results are
 not overwritten. After the runs finish, the script combines the Table 1 CSVs and
 creates scatter plots for every numeric metric.
+
+``--architecture`` selects which intervention harness to drive and which output
+subdirectory to read back:
+
+    gpt2  → intervention_analysis.py       (results/.../dataset_analysis/)
+    opt   → intervention_analysis_opt.py   (results/.../dataset_analysis_opt/)
+    qwen  → intervention_analysis_qwen.py  (results/.../dataset_analysis_qwen/)
+
+All three harnesses share the same Table 1 CSV schema, so aggregation and plotting
+are architecture-agnostic below.
 """
 
 from __future__ import annotations
@@ -24,7 +34,14 @@ import pandas as pd
 
 
 DEFAULT_SEEDS = [0, 1, 2, 3, 4, 5, 6]
-DATASET_ANALYSIS_DIR = "dataset_analysis"
+
+# Per-architecture harness script and the dataset-analysis subdirectory it writes.
+ARCHITECTURES = {
+    "gpt2": {"script": "intervention_analysis.py",      "dataset_dir": "dataset_analysis"},
+    "opt":  {"script": "intervention_analysis_opt.py",  "dataset_dir": "dataset_analysis_opt"},
+    "qwen": {"script": "intervention_analysis_qwen.py", "dataset_dir": "dataset_analysis_qwen"},
+}
+DEFAULT_ARCHITECTURE = "gpt2"
 
 
 def parse_seeds(value: str) -> list[int]:
@@ -52,22 +69,26 @@ def safe_model_tag(model_name: str) -> str:
 
 
 def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
+    script = ARCHITECTURES[args.architecture]["script"]
     cmd = [
         args.python,
-        "intervention_analysis.py",
+        script,
         "--mode",
         "dataset",
         "--output-dir",
         str(out_dir),
         "--seed",
         str(seed),
-        "--model",
+        "--model-name",
         args.model_name,
     ]
     if args.sample_size is not None:
         cmd.extend(["--sample-size", str(args.sample_size)])
     if args.cut_length is not None:
         cmd.extend(["--cut-length", str(args.cut_length)])
+    # --dtype only exists on the Qwen harness; forward it there when requested.
+    if args.architecture == "qwen" and args.dtype is not None:
+        cmd.extend(["--dtype", args.dtype])
 
     print("\n" + "=" * 80)
     print(f"Seed {seed}: {' '.join(cmd)}")
@@ -75,8 +96,8 @@ def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
-def read_seed_results(root: Path, seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    analysis_dir = seed_dir(root, seed) / DATASET_ANALYSIS_DIR
+def read_seed_results(root: Path, seed: int, dataset_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    analysis_dir = seed_dir(root, seed) / dataset_dir
     overall_path = analysis_dir / "bos_attention_stats_overall.csv"
     by_dataset_path = analysis_dir / "bos_attention_stats_by_dataset.csv"
 
@@ -113,14 +134,14 @@ def add_relative_metric(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def write_combined_csvs(root: Path, seeds: list[int]) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
+def write_combined_csvs(root: Path, seeds: list[int], dataset_dir: str) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
     aggregate_dir = root / "aggregate"
     aggregate_dir.mkdir(parents=True, exist_ok=True)
 
     overall_frames = []
     by_dataset_frames = []
     for seed in seeds:
-        overall, by_dataset = read_seed_results(root, seed)
+        overall, by_dataset = read_seed_results(root, seed, dataset_dir)
         overall_frames.append(overall)
         by_dataset_frames.append(by_dataset)
 
@@ -223,6 +244,14 @@ def main() -> None:
         description="Run Table 1 dataset analysis seven times and scatter-plot metrics."
     )
     parser.add_argument(
+        "--architecture",
+        choices=sorted(ARCHITECTURES),
+        default=DEFAULT_ARCHITECTURE,
+        help="Which intervention harness to drive: 'gpt2' (intervention_analysis.py), "
+             "'opt' (intervention_analysis_opt.py), or 'qwen' "
+             "(intervention_analysis_qwen.py). Default: gpt2.",
+    )
+    parser.add_argument(
         "--seeds",
         type=parse_seeds,
         default=DEFAULT_SEEDS,
@@ -244,24 +273,32 @@ def main() -> None:
         "--model",
         dest="model_name",
         default="gpt2",
-        help="Hugging Face GPT-2-family model name or local model path.",
+        help="Hugging Face model name or local path for the chosen architecture "
+             "(e.g. gpt2, facebook/opt-125m, Qwen/Qwen2.5-0.5B).",
     )
     parser.add_argument(
         "--python",
         default=sys.executable,
-        help="Python executable used to run intervention_analysis.py.",
+        help="Python executable used to run the intervention harness.",
     )
     parser.add_argument(
         "--sample-size",
         type=int,
         default=None,
-        help="Optional override forwarded to intervention_analysis.py.",
+        help="Optional override forwarded to the intervention harness.",
     )
     parser.add_argument(
         "--cut-length",
         type=int,
         default=None,
-        help="Optional override forwarded to intervention_analysis.py.",
+        help="Optional override forwarded to the intervention harness.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16", "auto"],
+        default=None,
+        help="Model dtype, forwarded to the Qwen harness only (ignored for gpt2/opt). "
+             "Larger Qwen2.5 checkpoints (7B/14B) typically need float16/bfloat16.",
     )
     parser.add_argument(
         "--skip-existing",
@@ -275,8 +312,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.experiment_name == "table1_multiseed" and args.model_name != "gpt2":
-        args.experiment_name = f"table1_multiseed_{safe_model_tag(args.model_name)}"
+    dataset_dir = ARCHITECTURES[args.architecture]["dataset_dir"]
+
+    if args.experiment_name == "table1_multiseed":
+        parts = ["table1_multiseed"]
+        if args.architecture != "gpt2":
+            parts.append(args.architecture)
+        if args.model_name != "gpt2":
+            parts.append(safe_model_tag(args.model_name))
+        args.experiment_name = "_".join(parts)
 
     root = args.output_dir / args.experiment_name
     root.mkdir(parents=True, exist_ok=True)
@@ -284,13 +328,13 @@ def main() -> None:
     if not args.plot_only:
         for seed in args.seeds:
             out_dir = seed_dir(root, seed)
-            overall_csv = out_dir / DATASET_ANALYSIS_DIR / "bos_attention_stats_overall.csv"
+            overall_csv = out_dir / dataset_dir / "bos_attention_stats_overall.csv"
             if args.skip_existing and overall_csv.exists():
                 print(f"Seed {seed}: found {overall_csv}; skipping.")
                 continue
             run_seed(args, seed, out_dir)
 
-    overall, by_dataset, aggregate_dir = write_combined_csvs(root, args.seeds)
+    overall, by_dataset, aggregate_dir = write_combined_csvs(root, args.seeds, dataset_dir)
     make_plots(overall, by_dataset, aggregate_dir)
 
     print("\nDone.")

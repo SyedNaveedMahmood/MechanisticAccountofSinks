@@ -119,6 +119,69 @@ python intervention_analysis_opt.py --mode sentence --model-name facebook/opt-12
 > dimension, so it is not directly comparable to the pre-LayerNorm circuit and is
 > rejected at load time. Use `opt-125m`, `opt-1.3b`, or `opt-2.7b`.
 
+### Table 1 (Qwen2.5) — RoPE-Family Replication
+
+`intervention_analysis_qwen.py` reruns the Table 1 intervention suite on Alibaba's
+Qwen2.5 models. Qwen2.5 is a useful contrast to GPT-2/OPT because it keeps the
+paper's central ingredient — a learned **query bias** (`q_proj.bias`,
+`attention_bias=True`, which Llama/Mistral drop) — but delivers positional
+information through **Rotary Position Embeddings (RoPE)** rather than learned
+additive absolute embeddings. Because nothing positional is added to the residual
+stream under RoPE, there is no separable *effective positional embedding* (EPE), so
+the positional interventions are reframed as RoPE **position-id** manipulations:
+
+- **(c) Remove First PE** → token 0 is rotated as if at position 1 (`pos_ids = [1,1,2,3,…]`).
+- **(d) Swap EPE / (e) Swap PE** → swap the RoPE positions of tokens 0 and 1
+  (`pos_ids = [1,0,2,3,…]`). Under RoPE the raw-PE vs effective-PE distinction
+  collapses, so (d) and (e) coincide; both rows are kept for column alignment.
+- **(h) No PE** → RoPE disabled (`pos_ids = 0` everywhere → identity rotation).
+- **(i) Zero Top-3 Wk** → zeros the Wk columns matching the top-3 magnitude dims of
+  the position-0 token embedding (the RoPE-model stand-in for the top-|EPE[0]| dims).
+
+The harness also handles Qwen2.5's grouped-query attention (`repeat_kv`), RMSNorm,
+and SwiGLU FFN. The metric and layer range (4–11) are unchanged; every listed
+checkpoint has ≥24 layers.
+
+```bash
+python intervention_analysis_qwen.py --mode dataset --model-name Qwen/Qwen2.5-0.5B --output-dir results
+python intervention_analysis_qwen.py --mode dataset --model-name Qwen/Qwen2.5-1.5B --output-dir results
+python intervention_analysis_qwen.py --mode dataset --model-name Qwen/Qwen2.5-3B   --output-dir results
+
+# Larger checkpoints usually need reduced precision to fit in memory
+python intervention_analysis_qwen.py --mode dataset --model-name Qwen/Qwen2.5-7B  --dtype bfloat16 --output-dir results
+python intervention_analysis_qwen.py --mode dataset --model-name Qwen/Qwen2.5-14B --dtype bfloat16 --output-dir results
+```
+
+Outputs:
+- `results/dataset_analysis_qwen/bos_attention_summary_mid_layers.txt` → **Table 1 (Qwen2.5)**
+- `results/dataset_analysis_qwen/bos_attention_summary_mid_layers.csv`
+- `results/dataset_analysis_qwen/bos_attention_stats_{by_dataset,overall}.csv`
+
+Multiseed Qwen2.5 Table 1 runs for seeds `0,1,2` (via the shared `--architecture` dispatch):
+
+```bash
+python run_table1_multiseed.py --architecture qwen --model Qwen/Qwen2.5-0.5B --seeds 0,1,2
+python run_table1_multiseed.py --architecture qwen --model Qwen/Qwen2.5-1.5B --seeds 0,1,2
+python run_table1_multiseed.py --architecture qwen --model Qwen/Qwen2.5-3B   --seeds 0,1,2
+python run_table1_multiseed.py --architecture qwen --model Qwen/Qwen2.5-7B  --dtype bfloat16 --seeds 0,1,2
+python run_table1_multiseed.py --architecture qwen --model Qwen/Qwen2.5-14B --dtype bfloat16 --seeds 0,1,2
+```
+
+Each seed writes to a separate directory under
+`results/table1_multiseed_qwen_<model>/seed_*/dataset_analysis_qwen/`. Combined
+CSVs and scatter plots are written under that run's `aggregate/` directory.
+
+Sentence-mode heatmap grids (the Qwen2.5 analog of **Fig 5**):
+
+```bash
+python intervention_analysis_qwen.py --mode sentence --model-name Qwen/Qwen2.5-0.5B --output-dir results
+# → results/sentence_analysis_qwen/layer_*_avg.png
+```
+
+> **Note:** the harness targets Qwen2/Qwen2.5 checkpoints that keep the learned
+> query bias. A checkpoint whose `q_proj.bias` is `None` is rejected at load time,
+> since without it the (b) *No Query Bias* intervention is a no-op.
+
 ### Figure 7 (appendix) — Massive Activations in EPE_1
 
 ```bash
