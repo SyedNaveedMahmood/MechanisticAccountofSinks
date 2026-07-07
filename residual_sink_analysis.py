@@ -48,6 +48,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from scipy import stats as scipy_stats
+from tqdm import tqdm
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 from datasets_loader import (
@@ -362,6 +363,10 @@ def iter_examples(model, tokenizer, sampled):
             yield ds_name, inputs["input_ids"], token_embeddings, pos_enc
 
 
+def count_examples(sampled):
+    return sum(len(sentences) for sentences in sampled.values())
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # E4.1 — Dose-response
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -372,7 +377,11 @@ def run_dose_response(model, tokenizer, sampled, alphas, massive_coords):
     knobs = ["scale_bq", "scale_epe_dir", "scale_massive"]
     acc = {(k, a): [] for k in knobs for a in alphas}
 
-    for _ds, _ids, te, pe in iter_examples(model, tokenizer, sampled):
+    for _ds, _ids, te, pe in tqdm(
+        iter_examples(model, tokenizer, sampled),
+        total=count_examples(sampled),
+        desc="dose_response examples",
+    ):
         ppes = compute_ppes(model, pe)
         epe0_hat = ppes[0] / torch.linalg.norm(ppes[0])
         for a in alphas:
@@ -402,7 +411,11 @@ def run_decomposition(model, tokenizer, sampled, assert_identity=False):
     per_example = {k: [] for k in
                    ("attn_full", "attn_content", "attn_delta", "share_delta", "align_red", "align_blue")}
     first = assert_identity
-    for _ds, _ids, te, pe in iter_examples(model, tokenizer, sampled):
+    for _ds, _ids, te, pe in tqdm(
+        iter_examples(model, tokenizer, sampled),
+        total=count_examples(sampled),
+        desc="decomposition examples",
+    ):
         stats = collect_decomposition_and_alignment(model, te, pe, assert_identity=first)
         first = False  # assert once is enough
         for k in per_example:
@@ -451,7 +464,11 @@ def run_intervention_set(model, tokenizer, sampled, names, specs):
     """Run a named set of interventions, returning per-name BOS-attention (% of baseline)."""
     num_layers = len(model.transformer.h)
     acc = {n: [] for n in names}
-    for _ds, _ids, te, pe in iter_examples(model, tokenizer, sampled):
+    for _ds, _ids, te, pe in tqdm(
+        iter_examples(model, tokenizer, sampled),
+        total=count_examples(sampled),
+        desc="intervention examples",
+    ):
         for n in names:
             acc[n].append(bos_metric(specs[n](te, pe), num_layers))
     means = {n: float(np.mean(v)) for n, v in acc.items()}
@@ -471,7 +488,11 @@ def run_relocation(model, tokenizer, sampled):
     num_layers = len(model.transformer.h)
     acc = {k: [] for k in ("base_pos0", "base_pos1",
                            "swap_pos0", "swap_pos1", "bq0swap_pos0", "bq0swap_pos1")}
-    for _ds, _ids, te, pe in iter_examples(model, tokenizer, sampled):
+    for _ds, _ids, te, pe in tqdm(
+        iter_examples(model, tokenizer, sampled),
+        total=count_examples(sampled),
+        desc="relocation examples",
+    ):
         ppes = compute_ppes(model, pe)
         hats = (ppes[0] / torch.linalg.norm(ppes[0]), ppes[1] / torch.linalg.norm(ppes[1]))
         base = run_config(model, te, pe)
@@ -503,7 +524,11 @@ def run_perplexity(model, tokenizer, sampled, massive_coords):
     }
     acc = {n: [] for n in configs}
     acc_hf = []
-    for _ds, ids, te, pe in iter_examples(model, tokenizer, sampled):
+    for _ds, ids, te, pe in tqdm(
+        iter_examples(model, tokenizer, sampled),
+        total=count_examples(sampled),
+        desc="perplexity examples",
+    ):
         with torch.no_grad():
             hf_logits = model(input_ids=ids).logits
         acc_hf.append(sequence_cross_entropy(hf_logits, ids))
@@ -597,22 +622,28 @@ def run_all_modes(model, tokenizer, sampled, modes, alphas, massive_coords, with
     """Run the requested modes for one seed; return a dict of results (DataFrames / arrays)."""
     res = {}
     if "dose_response" in modes:
+        print("Running mode: dose_response")
         res["dose_response"] = run_dose_response(model, tokenizer, sampled, alphas, massive_coords)
     if "decomposition" in modes:
+        print("Running mode: decomposition")
         res["decomposition"] = run_decomposition(model, tokenizer, sampled, assert_identity=True)
     if "combined" in modes or "surgical" in modes:
         specs = _combined_and_surgical_specs(model, massive_coords)
         if "combined" in modes:
+            print("Running mode: combined")
             names = ["baseline", "nullify_bq", "bq0__remove_first_pe", "bq0__zero_top3_wk",
                      "bq0__swap_epe", "bq0__zero_top3_wk__swap_epe"]
             res["combined"] = run_intervention_set(model, tokenizer, sampled, names, specs)
         if "surgical" in modes:
+            print("Running mode: surgical")
             names = ["baseline", "first_layer_mlp_skip", "all_layer_no_mlp",
                      "pos1_only_pe_zero", "all_pos_no_pe"]
             res["surgical"] = run_intervention_set(model, tokenizer, sampled, names, specs)
     if "relocation" in modes:
+        print("Running mode: relocation")
         res["relocation"] = run_relocation(model, tokenizer, sampled)
     if with_perplexity or "perplexity" in modes:
+        print("Running mode: perplexity")
         res["perplexity"] = run_perplexity(model, tokenizer, sampled, massive_coords)
     return res
 
