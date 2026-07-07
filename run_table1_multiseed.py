@@ -1,0 +1,302 @@
+"""Run Table 1 dataset experiments across multiple seeds and plot variation.
+
+This wrapper runs:
+
+    python intervention_analysis.py --mode dataset --output-dir <seed_output> --seed <seed>
+
+for seven seeds by default. Each seed writes to its own directory so results are
+not overwritten. After the runs finish, the script combines the Table 1 CSVs and
+creates scatter plots for every numeric metric.
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+DEFAULT_SEEDS = [0, 1, 2, 3, 4, 5, 6]
+DATASET_ANALYSIS_DIR = "dataset_analysis"
+
+
+def parse_seeds(value: str) -> list[int]:
+    seeds = []
+    for part in value.split(","):
+        part = part.strip()
+        if part:
+            seeds.append(int(part))
+    if not seeds:
+        raise argparse.ArgumentTypeError("Provide at least one seed.")
+    return seeds
+
+
+def seed_dir(root: Path, seed: int) -> Path:
+    return root / f"seed_{seed:03d}"
+
+
+def safe_model_tag(model_name: str) -> str:
+    return (
+        model_name.replace("\\", "_")
+        .replace("/", "_")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
+
+
+def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
+    cmd = [
+        args.python,
+        "intervention_analysis.py",
+        "--mode",
+        "dataset",
+        "--output-dir",
+        str(out_dir),
+        "--seed",
+        str(seed),
+        "--model",
+        args.model_name,
+    ]
+    if args.sample_size is not None:
+        cmd.extend(["--sample-size", str(args.sample_size)])
+    if args.cut_length is not None:
+        cmd.extend(["--cut-length", str(args.cut_length)])
+
+    print("\n" + "=" * 80)
+    print(f"Seed {seed}: {' '.join(cmd)}")
+    print("=" * 80)
+    subprocess.run(cmd, check=True)
+
+
+def read_seed_results(root: Path, seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    analysis_dir = seed_dir(root, seed) / DATASET_ANALYSIS_DIR
+    overall_path = analysis_dir / "bos_attention_stats_overall.csv"
+    by_dataset_path = analysis_dir / "bos_attention_stats_by_dataset.csv"
+
+    if not overall_path.exists():
+        raise FileNotFoundError(f"Missing {overall_path}")
+    if not by_dataset_path.exists():
+        raise FileNotFoundError(f"Missing {by_dataset_path}")
+
+    overall = pd.read_csv(overall_path)
+    by_dataset = pd.read_csv(by_dataset_path)
+    overall.insert(0, "seed", seed)
+    by_dataset.insert(0, "seed", seed)
+    return overall, by_dataset
+
+
+def add_relative_metric(df: pd.DataFrame) -> pd.DataFrame:
+    """Add percentage of baseline per seed and dataset group."""
+    df = df.copy()
+    group_cols = ["seed"]
+    if "dataset" in df.columns:
+        group_cols.append("dataset")
+
+    df["mean_bos_attention"] = pd.to_numeric(df["mean_bos_attention"])
+    df["stderr"] = pd.to_numeric(df["stderr"])
+
+    baseline = (
+        df[df["intervention"] == "int_a"][group_cols + ["mean_bos_attention"]]
+        .rename(columns={"mean_bos_attention": "baseline_mean_bos_attention"})
+    )
+    df = df.merge(baseline, on=group_cols, how="left")
+    df["relative_to_baseline_pct"] = (
+        100.0 * df["mean_bos_attention"] / df["baseline_mean_bos_attention"]
+    )
+    return df
+
+
+def write_combined_csvs(root: Path, seeds: list[int]) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
+    aggregate_dir = root / "aggregate"
+    aggregate_dir.mkdir(parents=True, exist_ok=True)
+
+    overall_frames = []
+    by_dataset_frames = []
+    for seed in seeds:
+        overall, by_dataset = read_seed_results(root, seed)
+        overall_frames.append(overall)
+        by_dataset_frames.append(by_dataset)
+
+    overall_all = add_relative_metric(pd.concat(overall_frames, ignore_index=True))
+    by_dataset_all = add_relative_metric(pd.concat(by_dataset_frames, ignore_index=True))
+
+    overall_all.to_csv(aggregate_dir / "table1_multiseed_overall.csv", index=False)
+    by_dataset_all.to_csv(aggregate_dir / "table1_multiseed_by_dataset.csv", index=False)
+
+    summary_cols = ["dataset", "intervention", "description"]
+    summary = (
+        by_dataset_all.groupby(summary_cols, as_index=False)
+        .agg(
+            mean_bos_attention_mean=("mean_bos_attention", "mean"),
+            mean_bos_attention_std=("mean_bos_attention", "std"),
+            stderr_mean=("stderr", "mean"),
+            relative_to_baseline_pct_mean=("relative_to_baseline_pct", "mean"),
+            relative_to_baseline_pct_std=("relative_to_baseline_pct", "std"),
+            n_seeds=("seed", "nunique"),
+        )
+    )
+    summary.to_csv(aggregate_dir / "table1_multiseed_summary_by_dataset.csv", index=False)
+
+    overall_summary = (
+        overall_all.groupby(["intervention", "description"], as_index=False)
+        .agg(
+            mean_bos_attention_mean=("mean_bos_attention", "mean"),
+            mean_bos_attention_std=("mean_bos_attention", "std"),
+            stderr_mean=("stderr", "mean"),
+            relative_to_baseline_pct_mean=("relative_to_baseline_pct", "mean"),
+            relative_to_baseline_pct_std=("relative_to_baseline_pct", "std"),
+            n_seeds=("seed", "nunique"),
+        )
+    )
+    overall_summary.to_csv(aggregate_dir / "table1_multiseed_summary_overall.csv", index=False)
+
+    return overall_all, by_dataset_all, aggregate_dir
+
+
+def scatter_metric(
+    df: pd.DataFrame,
+    metric: str,
+    title: str,
+    output_path: Path,
+    dataset: str | None = None,
+) -> None:
+    plot_df = df.copy()
+    if dataset is not None:
+        plot_df = plot_df[plot_df["dataset"] == dataset]
+
+    descriptions = (
+        plot_df[["intervention", "description"]]
+        .drop_duplicates()
+        .sort_values("intervention")
+    )
+
+    fig, ax = plt.subplots(figsize=(13, 7))
+    for _, row in descriptions.iterrows():
+        intervention = row["intervention"]
+        label = f"{intervention}: {row['description']}"
+        sub = plot_df[plot_df["intervention"] == intervention].sort_values("seed")
+        ax.scatter(sub["seed"], sub[metric], label=label, s=55, alpha=0.85)
+        ax.plot(sub["seed"], sub[metric], linewidth=1, alpha=0.35)
+
+    ax.set_title(title)
+    ax.set_xlabel("Seed")
+    ax.set_ylabel(metric)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_plots(overall: pd.DataFrame, by_dataset: pd.DataFrame, aggregate_dir: Path) -> None:
+    plot_dir = aggregate_dir / "scatter_plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics = ["mean_bos_attention", "stderr", "relative_to_baseline_pct"]
+    for metric in metrics:
+        scatter_metric(
+            overall,
+            metric,
+            f"Table 1 multiseed overall: {metric}",
+            plot_dir / f"overall_{metric}.png",
+        )
+
+        for dataset in sorted(by_dataset["dataset"].unique()):
+            scatter_metric(
+                by_dataset,
+                metric,
+                f"Table 1 multiseed {dataset}: {metric}",
+                plot_dir / f"{dataset}_{metric}.png",
+                dataset=dataset,
+            )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run Table 1 dataset analysis seven times and scatter-plot metrics."
+    )
+    parser.add_argument(
+        "--seeds",
+        type=parse_seeds,
+        default=DEFAULT_SEEDS,
+        help="Comma-separated seeds. Default: 0,1,2,3,4,5,6",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results"),
+        help="Root results directory. Default: results",
+    )
+    parser.add_argument(
+        "--experiment-name",
+        default="table1_multiseed",
+        help="Subdirectory under --output-dir for multiseed runs.",
+    )
+    parser.add_argument(
+        "--model-name",
+        "--model",
+        dest="model_name",
+        default="gpt2",
+        help="Hugging Face GPT-2-family model name or local model path.",
+    )
+    parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help="Python executable used to run intervention_analysis.py.",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Optional override forwarded to intervention_analysis.py.",
+    )
+    parser.add_argument(
+        "--cut-length",
+        type=int,
+        default=None,
+        help="Optional override forwarded to intervention_analysis.py.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip a seed when its overall CSV already exists.",
+    )
+    parser.add_argument(
+        "--plot-only",
+        action="store_true",
+        help="Do not run experiments; only aggregate and plot existing seed outputs.",
+    )
+    args = parser.parse_args()
+
+    if args.experiment_name == "table1_multiseed" and args.model_name != "gpt2":
+        args.experiment_name = f"table1_multiseed_{safe_model_tag(args.model_name)}"
+
+    root = args.output_dir / args.experiment_name
+    root.mkdir(parents=True, exist_ok=True)
+
+    if not args.plot_only:
+        for seed in args.seeds:
+            out_dir = seed_dir(root, seed)
+            overall_csv = out_dir / DATASET_ANALYSIS_DIR / "bos_attention_stats_overall.csv"
+            if args.skip_existing and overall_csv.exists():
+                print(f"Seed {seed}: found {overall_csv}; skipping.")
+                continue
+            run_seed(args, seed, out_dir)
+
+    overall, by_dataset, aggregate_dir = write_combined_csvs(root, args.seeds)
+    make_plots(overall, by_dataset, aggregate_dir)
+
+    print("\nDone.")
+    print(f"Seed outputs: {root}")
+    print(f"Combined CSVs and scatter plots: {aggregate_dir}")
+
+
+if __name__ == "__main__":
+    main()

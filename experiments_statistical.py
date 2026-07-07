@@ -81,6 +81,7 @@ def run_analysis(model, tokenizer, output_dir,
         if (idx + 1) % 25 == 0 or idx == 0:
             print(f"  [{idx + 1}/{n_sentences}] processing…")
         inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
+        inputs = inputs.to(model.device)
         pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
 
         with torch.no_grad():
@@ -334,6 +335,7 @@ def epe_validation_analysis(model, tokenizer, output_dir,
         if (idx + 1) % 25 == 0 or idx == 0:
             print(f"  [{idx + 1}/{n_sentences}] processing…")
         inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
+        inputs = inputs.to(model.device)
         pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
 
         with torch.no_grad():
@@ -450,7 +452,7 @@ def coord_alignment_analysis(model, output_dir):
 
     # ── Identify massive coordinates of EPE_1 ────────────────────────────────
     with torch.no_grad():
-        pe_first   = model.transformer.wpe(torch.tensor([[0]]))          # [1,1,H]
+        pe_first   = model.transformer.wpe(torch.tensor([[0]], device=model.device))          # [1,1,H]
         ppes_first = pe_first[0, 0] + model.transformer.h[0].mlp(pe_first)[0, 0]  # [H]
 
     abs_vals = ppes_first.abs()
@@ -603,10 +605,12 @@ def main():
     args = parser.parse_args()
 
     print("Loading GPT-2…")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GPT2LMHeadModel.from_pretrained("gpt2", attn_implementation="eager")
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    model.to(device)
     model.eval()
-    print("Model loaded.\n")
+    print(f"Model loaded on {device}.\n")
 
     if args.mode == "bias-term":
         run_analysis(

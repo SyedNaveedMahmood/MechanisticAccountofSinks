@@ -620,6 +620,7 @@ def sentence_analysis(model, tokenizer, sentence, output_dir):
     output_path.mkdir(parents=True, exist_ok=True)
 
     inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
+    inputs = inputs.to(model.device)
     pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
     tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
 
@@ -671,6 +672,7 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers):
     for i, sentence in enumerate(sentences):
         print(f"  [{ds_label} {i + 1}/{n}] {sentence[:80]}...")
         inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
+        inputs = inputs.to(model.device)
         pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
         results = run_all_interventions(model, token_embeddings, pos_enc)
         for key, *_ in INTERVENTIONS:
@@ -805,6 +807,14 @@ def main():
         help="Root directory for all outputs.",
     )
     parser.add_argument(
+        "--model-name",
+        "--model",
+        dest="model_name",
+        type=str,
+        default="gpt2",
+        help="Hugging Face GPT-2 model name or local model path.",
+    )
+    parser.add_argument(
         "--sample-size",
         type=int,
         default=DEFAULT_SAMPLE_SIZE,
@@ -825,11 +835,13 @@ def main():
     )
     args = parser.parse_args()
 
-    print("Loading GPT-2...")
-    model = GPT2LMHeadModel.from_pretrained("gpt2", attn_implementation="eager")
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    print(f"Loading model: {args.model_name}...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = GPT2LMHeadModel.from_pretrained(args.model_name, attn_implementation="eager")
+    tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
+    model.to(device)
     model.eval()
-    print("Model loaded.\n")
+    print(f"Model loaded on {device}.\n")
 
     if args.mode == "sentence":
         sentence_analysis(model, tokenizer, args.sentence, args.output_dir)

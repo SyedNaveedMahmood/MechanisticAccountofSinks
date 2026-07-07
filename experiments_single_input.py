@@ -265,7 +265,7 @@ def _compute_perhead_epe_cosine(model, num_positions):
     head_dim = hidden_size // num_heads
 
     with torch.no_grad():
-        pos_ids = torch.arange(num_positions).unsqueeze(0)  # [1, num_pos]
+        pos_ids = torch.arange(num_positions, device=model.device).unsqueeze(0)  # [1, num_pos]
         pe = model.transformer.wpe(pos_ids)  # [1, num_pos, hidden]
         epes = pe[0] + model.transformer.h[0].mlp(pe)[0]  # [num_pos, hidden]
 
@@ -370,7 +370,7 @@ def massive_activations_analysis(model, output_dir):
     output_path.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
-        pe_first = model.transformer.wpe(torch.tensor([[0]]))
+        pe_first = model.transformer.wpe(torch.tensor([[0]], device=model.device))
         epe_first = pe_first[0, 0] + model.transformer.h[0].mlp(pe_first)[0, 0]
 
     values = epe_first.detach().cpu().numpy()
@@ -421,9 +421,11 @@ def main():
     args = parser.parse_args()
 
     print("Loading GPT-2…")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GPT2LMHeadModel.from_pretrained("gpt2", attn_implementation="eager")
+    model.to(device)
     model.eval()
-    print("Model loaded.\n")
+    print(f"Model loaded on {device}.\n")
 
     if args.mode == "massive-activations":
         massive_activations_analysis(model, args.output_dir)

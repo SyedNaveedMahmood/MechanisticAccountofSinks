@@ -64,9 +64,32 @@ Outputs:
 python intervention_analysis.py --mode dataset --output-dir results
 ```
 
+Supported GPT-2-family model variants:
+
+```bash
+python intervention_analysis.py --mode dataset --output-dir results --model gpt2
+python intervention_analysis.py --mode dataset --output-dir results --model distilgpt2
+python intervention_analysis.py --mode dataset --output-dir results --model gpt2-medium
+python intervention_analysis.py --mode dataset --output-dir results --model gpt2-large
+python intervention_analysis.py --mode dataset --output-dir results --model gpt2-xl
+```
+
+The intervention code uses GPT-2-specific internals, so model families such as
+OPT and GPT-Neo are not supported by this script without additional adapters.
+
 Outputs:
 - `results/dataset_analysis/bos_attention_summary_mid_layers.txt` → **Table 1**
 - `results/dataset_analysis/bos_attention_summary_mid_layers.csv`
+
+Multiseed Table 1 run:
+
+```bash
+python run_table1_multiseed.py
+```
+
+By default this runs seeds `0,1,2,3,4,5,6`, writing each run under
+`results/table1_multiseed/seed_*/dataset_analysis/`. Combined CSVs and scatter
+plots are written under `results/table1_multiseed/aggregate/`.
 
 ### Figure 7 (appendix) — Massive Activations in EPE_1
 
