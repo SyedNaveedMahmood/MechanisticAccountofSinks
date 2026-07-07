@@ -99,6 +99,7 @@ def get_initial_embeddings(model, inputs):
 def manual_self_attention_new(hidden_states, layer,
                               ppes=None,
                               intervene_query_bias=False,
+                              query_bias_scale=1.0,
                               fixed_wk_zero_indices=None,
                               random_wk_zero_rows=False):
     """
@@ -109,6 +110,9 @@ def manual_self_attention_new(hidden_states, layer,
         layer (torch.nn.Module): The transformer layer module containing the attention sub-layer.
         ppes (torch.Tensor, optional): Positional embeddings (effective positional embeddings) for similarity calculations. Defaults to None.
         intervene_query_bias (bool): If True, nullify the query bias.
+        query_bias_scale (float): Multiplicative scale applied to the query bias bq
+            (used for the dose-response sweep; 1.0 = unchanged, 0.0 = nullified).
+            Ignored when ``intervene_query_bias`` is True (which forces bq = 0).
         fixed_wk_zero_indices (list or None): If a list of indices is provided, zero out these columns in Wk.
         random_wk_zero_rows (bool): If True, zero out 3 random columns in Wk.
 
@@ -142,9 +146,11 @@ def manual_self_attention_new(hidden_states, layer,
     wq, wk, wv = qkv_weight.chunk(3, dim=0)
     bq, bk, bv = qkv_bias.chunk(3, dim=0)
 
-    # --- INTERVENTION A: Nullify query bias ---
+    # --- INTERVENTION A: Nullify query bias (or scale it for dose-response) ---
     if intervene_query_bias:
         bq = torch.zeros_like(bq)
+    elif query_bias_scale != 1.0:
+        bq = query_bias_scale * bq
 
     # Calculate Wq multiplied by Wk transposed
     wq_wk_t_product = F.linear(wq, wk.t())
@@ -501,8 +507,9 @@ def run_all_interventions(model, token_embeddings, pos_enc):
 LAYER_RANGE_START = 3   # 0-indexed inclusive  (paper layer 4)
 LAYER_RANGE_END = 11    # 0-indexed exclusive  (paper layer 11)
 
-def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope="mid"):
-    """Average attention to BOS from 2nd-half tokens over selected layers, across all heads.
+def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope="mid",
+                                 target_pos=0):
+    """Average attention to a target position from 2nd-half tokens over selected layers, across all heads.
 
     Parameters
     ----------
@@ -513,11 +520,15 @@ def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope
     layer_scope : str
         ``"mid"`` — layers 4-11 (1-indexed), i.e. 0-indexed [3, 11).
         ``"all"`` — every layer ``0 .. num_layers-1``.
+    target_pos : int
+        Key position whose received attention is measured. Defaults to 0 (the BOS
+        sink position, matching the paper's metric). Set to 1 for the relocation
+        metric (attention to the Swap-EPE transplant target, position 2 1-indexed).
 
     Returns
     -------
     float
-        Scalar BOS-attention metric (averaged over heads, tokens, and layers).
+        Scalar attention metric (averaged over heads, tokens, and layers).
     """
     if layer_scope == "all":
         layer_start = 0
@@ -534,7 +545,7 @@ def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope
     values = []
     for layer_idx in range(layer_start, layer_end):
         attn = attn_weights_per_layer[layer_idx]  # [num_heads, seq, seq]
-        bos_attn = attn[:, second_half_start:, 0].mean().item()
+        bos_attn = attn[:, second_half_start:, target_pos].mean().item()
         values.append(bos_attn)
 
     return float(np.mean(values))

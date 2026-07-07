@@ -240,3 +240,57 @@ python experiments_single_input.py --mode massive-activations --output-dir resul
 
 Output:
 - `results/massive_activations/massive_activations_in_ppe.png` → **Fig 7**
+
+## Extension — Anatomy of the Residual Sink (E4)
+
+`residual_sink_analysis.py` extends the Table 1 story to the *residual* sink the
+paper leaves unexplained (§5.3): nullifying `b_Q` still leaves **44.7%** of the sink,
+and zeroing the top-3 `W_k` columns leaves **65.2%**. The paper's pre-softmax score
+decomposes as
+
+```
+s_{i→j} = x_i W_q W_k^T x_j^T (T1, content)  +  x_i W_q b_K^T (T2)
+        + b_Q W_k^T x_j^T (T3 = Δ_j, source-agnostic shift)  +  b_Q b_K^T (T4),
+```
+
+and because softmax-over-targets cancels the target-constant terms (T2, T4), the
+attention distribution is driven by **T1 + T3** only. Nullifying `b_Q` zeros T3, so the
+residual is the **content term T1 routed through `k_1 ≈ EPE_1 W_k`** — a *second*
+positional pathway that shares the massive-activation key structure but is driven by
+downstream **query** alignment rather than the query bias. This harness tests that
+account with graded, decomposed, and combined causal analyses. It reuses the exact
+Table 1 forward-pass machinery (`intervention_analysis.py`) and runs over seeds `0,1,2`
+by default (data resamples), writing per-seed dirs plus a cross-seed `aggregate/`.
+
+```bash
+# Run all five core analyses (dose-response, decomposition, combined, surgical, relocation)
+python residual_sink_analysis.py --mode all --model-name gpt2 --output-dir results
+
+# Include the optional functional-cost (LM cross-entropy) table
+python residual_sink_analysis.py --mode all --with-perplexity --output-dir results
+
+# A single analysis, or a quick check on fewer examples
+python residual_sink_analysis.py --mode dose_response --sample-size 20 --seeds 0
+```
+
+Modes (each maps to a paper-ready deliverable):
+
+- **`dose_response` (E4.1)** — BOS-attention vs. scale `α ∈ {0,…,1.5}` on three knobs:
+  `b_Q` (pathway A), the EPE_1 direction, and the massive coordinates (both shared).
+  The differing `α=0` **floors** (≈44.7% for `b_Q`, ≈3% for EPE_1) are the two-pathway
+  signature. → `aggregate/dose_response.png`, `dose_response_monotonicity.csv`.
+- **`decomposition` (E4.2)** — exact T1-vs-T3 attribution of the position-1 advantage
+  (with an identity assert `T1+T2+T3+T4 == score`), plus the query–EPE_1 alignment
+  histogram (the Fig. 2 analog for downstream queries).
+  → `aggregate/query_alignment_hist.png`, `delta_share_heatmap.png`, `decomposition_summary.csv`.
+- **`combined` (E4.3)** — stacked interventions (`b∧c`, `b∧i`, `b∧d`, `b∧i∧d`) that
+  localize the residual. → `aggregate/combined_summary.csv`.
+- **`surgical` (E4.4)** — first-layer-only MLP skip and position-1-only PE zeroing vs.
+  the paper's coarse all-layer / all-position ablations. → `aggregate/surgical_summary.csv`.
+- **`relocation` (E4.5)** — attention to position 2 (the Swap-EPE transplant target):
+  does the sink *move* or merely vanish? → `aggregate/relocation_summary.csv`.
+- **`perplexity` (E4.6, optional)** — LM cross-entropy cost of each pathway ablation.
+
+> **Note:** all runs are fp32 to match the paper's tight SEs, and every figure is
+> regenerable from cached per-seed outputs via `--plot-only`. The massive-activation
+> coordinates (paper: 138, 378, 447) are re-identified per model at load time.
