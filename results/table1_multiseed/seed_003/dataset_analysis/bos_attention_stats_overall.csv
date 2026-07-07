@@ -1,0 +1,11 @@
+dataset,intervention,description,n_examples,mean_bos_attention,stderr,display
+all_datasets,int_a,Baseline,300,0.565626,0.002060,0.5656 ± 0.0021
+all_datasets,int_b,No Query Bias,300,0.251495,0.001656,0.2515 ± 0.0017
+all_datasets,int_c,Remove First PE,300,0.016477,0.000608,0.0165 ± 0.0006
+all_datasets,int_d,Swap EPE,300,0.034978,0.000803,0.0350 ± 0.0008
+all_datasets,int_e,Swap PE,300,0.562767,0.002541,0.5628 ± 0.0025
+all_datasets,int_f,Nullify BOS Token,300,0.563677,0.002034,0.5637 ± 0.0020
+all_datasets,int_g,No MLP,300,0.279275,0.005067,0.2793 ± 0.0051
+all_datasets,int_h,No PE,300,0.109571,0.007365,0.1096 ± 0.0074
+all_datasets,int_i,Zero Top-3 Wk,300,0.367501,0.001806,0.3675 ± 0.0018
+all_datasets,int_j,Zero Random Wk,300,0.566019,0.002062,0.5660 ± 0.0021

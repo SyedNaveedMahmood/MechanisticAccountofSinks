@@ -1,0 +1,31 @@
+dataset,intervention,description,n_examples,mean_bos_attention,stderr,display
+sst2,int_a,Baseline,100,0.603901,0.002728,0.6039 ± 0.0027
+sst2,int_b,No Query Bias,100,0.271508,0.002684,0.2715 ± 0.0027
+sst2,int_c,Remove First PE,100,0.014467,0.000793,0.0145 ± 0.0008
+sst2,int_d,Swap EPE,100,0.039195,0.001077,0.0392 ± 0.0011
+sst2,int_e,Swap PE,100,0.588963,0.006276,0.5890 ± 0.0063
+sst2,int_f,Nullify BOS Token,100,0.600730,0.002701,0.6007 ± 0.0027
+sst2,int_g,No MLP,100,0.246382,0.009357,0.2464 ± 0.0094
+sst2,int_h,No PE,100,0.093352,0.014813,0.0934 ± 0.0148
+sst2,int_i,Zero Top-3 Wk,100,0.398826,0.002833,0.3988 ± 0.0028
+sst2,int_j,Zero Random Wk,100,0.604473,0.002721,0.6045 ± 0.0027
+gsm8k,int_a,Baseline,100,0.547899,0.002619,0.5479 ± 0.0026
+gsm8k,int_b,No Query Bias,100,0.236959,0.001950,0.2370 ± 0.0020
+gsm8k,int_c,Remove First PE,100,0.015202,0.001101,0.0152 ± 0.0011
+gsm8k,int_d,Swap EPE,100,0.036527,0.002016,0.0365 ± 0.0020
+gsm8k,int_e,Swap PE,100,0.547115,0.003191,0.5471 ± 0.0032
+gsm8k,int_f,Nullify BOS Token,100,0.548900,0.002700,0.5489 ± 0.0027
+gsm8k,int_g,No MLP,100,0.282610,0.008061,0.2826 ± 0.0081
+gsm8k,int_h,No PE,100,0.127493,0.013419,0.1275 ± 0.0134
+gsm8k,int_i,Zero Top-3 Wk,100,0.362274,0.002233,0.3623 ± 0.0022
+gsm8k,int_j,Zero Random Wk,100,0.548099,0.002601,0.5481 ± 0.0026
+humaneval,int_a,Baseline,100,0.539033,0.001865,0.5390 ± 0.0019
+humaneval,int_b,No Query Bias,100,0.243907,0.002490,0.2439 ± 0.0025
+humaneval,int_c,Remove First PE,100,0.022262,0.001003,0.0223 ± 0.0010
+humaneval,int_d,Swap EPE,100,0.027300,0.000268,0.0273 ± 0.0003
+humaneval,int_e,Swap PE,100,0.540480,0.001914,0.5405 ± 0.0019
+humaneval,int_f,Nullify BOS Token,100,0.536150,0.001895,0.5361 ± 0.0019
+humaneval,int_g,No MLP,100,0.309866,0.005974,0.3099 ± 0.0060
+humaneval,int_h,No PE,100,0.078167,0.005919,0.0782 ± 0.0059
+humaneval,int_i,Zero Top-3 Wk,100,0.340851,0.001542,0.3409 ± 0.0015
+humaneval,int_j,Zero Random Wk,100,0.539254,0.001868,0.5393 ± 0.0019
