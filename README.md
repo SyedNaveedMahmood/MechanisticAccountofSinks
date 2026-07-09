@@ -297,3 +297,29 @@ Modes (each maps to a paper-ready deliverable):
 > **Note:** all runs are fp32 to match the paper's tight SEs, and every figure is
 > regenerable from cached per-seed outputs via `--plot-only`. The massive-activation
 > coordinates (paper: 138, 378, 447) are re-identified per model at load time.
+
+## Cross-scale runs (all harnesses)
+
+Every intervention harness — GPT-2 (`intervention_analysis.py`), OPT
+(`intervention_analysis_opt.py`), GPT-Neo (`intervention_analysis_neo.py`),
+Qwen2.5 (`intervention_analysis_qwen.py`), and the residual-sink E4 harness
+(`residual_sink_analysis.py`) — accepts two flags for running across model scales:
+
+- `--layer-mode {scaled,fixed}` (default `scaled`) — the mid-layer band of the
+  BOS metric. `scaled` excludes the first 3 and the last layer, reducing to exactly
+  layers 4–11 for a 12-layer model (so gpt2 / opt-125m / gpt-neo-125m are unchanged
+  and match the paper) and extending proportionally for deeper checkpoints; `fixed`
+  forces layers 4–11 on every size for strict same-layer comparability. The full-depth
+  `all_layers` summary is still written alongside.
+- `--dtype {float32,float16,bfloat16}` (default `float32`, matching the paper's SEs;
+  Qwen also accepts `auto`) — drop to a smaller dtype only if VRAM-constrained on a
+  large model (e.g. gpt2-xl, opt-2.7b).
+
+`run_table1_multiseed.py` forwards both flags to whichever harness it drives. Examples:
+
+```bash
+python intervention_analysis.py --mode dataset --model-name gpt2-large --output-dir results
+python intervention_analysis_opt.py --mode dataset --model-name facebook/opt-2.7b --dtype float16 --output-dir results
+python residual_sink_analysis.py --mode all --model-name gpt2-xl --output-dir results
+python run_table1_multiseed.py --architecture neo --model EleutherAI/gpt-neo-1.3B --layer-mode scaled
+```

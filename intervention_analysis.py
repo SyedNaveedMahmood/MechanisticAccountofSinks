@@ -516,8 +516,22 @@ def run_all_interventions(model, token_embeddings, pos_enc):
 LAYER_RANGE_START = 3   # 0-indexed inclusive  (paper layer 4)
 LAYER_RANGE_END = 11    # 0-indexed exclusive  (paper layer 11)
 
+
+def compute_band(num_layers, layer_mode="scaled"):
+    """0-indexed mid-layer band ``[start, end)`` for the BOS metric, across model scales.
+
+    ``scaled`` (default) excludes the first 3 and the last layer — reducing to exactly
+    ``[3, 11)`` for a 12-layer model (the paper's layers 4–11, so small models are
+    unchanged) and extending proportionally for deeper models. ``fixed`` forces
+    ``[3, 11)`` on every size for strict same-layer comparability.
+    """
+    if layer_mode == "fixed":
+        return (LAYER_RANGE_START, min(LAYER_RANGE_END, num_layers))
+    return (LAYER_RANGE_START, max(LAYER_RANGE_START + 1, num_layers - 1))
+
+
 def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope="mid",
-                                 target_pos=0):
+                                 target_pos=0, layer_start=None, layer_end=None):
     """Average attention to a target position from 2nd-half tokens over selected layers, across all heads.
 
     Parameters
@@ -533,18 +547,22 @@ def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope
         Key position whose received attention is measured. Defaults to 0 (the BOS
         sink position, matching the paper's metric). Set to 1 for the relocation
         metric (attention to the Swap-EPE transplant target, position 2 1-indexed).
+    layer_start, layer_end : int or None
+        Explicit 0-indexed band ``[layer_start, layer_end)``. When both are given they
+        override ``layer_scope`` (used by the cross-scale harnesses to pass a depth-aware
+        band from :func:`compute_band`); otherwise the ``layer_scope`` band is used.
 
     Returns
     -------
     float
         Scalar attention metric (averaged over heads, tokens, and layers).
     """
-    if layer_scope == "all":
-        layer_start = 0
-        layer_end = num_layers
+    if layer_start is not None and layer_end is not None:
+        ls, le = layer_start, layer_end
+    elif layer_scope == "all":
+        ls, le = 0, num_layers
     elif layer_scope == "mid":
-        layer_start = LAYER_RANGE_START
-        layer_end = min(LAYER_RANGE_END, num_layers)
+        ls, le = LAYER_RANGE_START, min(LAYER_RANGE_END, num_layers)
     else:
         raise ValueError(f"layer_scope must be 'all' or 'mid', got {layer_scope!r}")
 
@@ -552,7 +570,7 @@ def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope
     second_half_start = seq_len // 2
 
     values = []
-    for layer_idx in range(layer_start, layer_end):
+    for layer_idx in range(ls, le):
         attn = attn_weights_per_layer[layer_idx]  # [num_heads, seq, seq]
         bos_attn = attn[:, second_half_start:, target_pos].mean().item()
         values.append(bos_attn)
@@ -684,8 +702,13 @@ def sentence_analysis(model, tokenizer, sentence, output_dir):
 # Mode 2 — Dataset analysis (three benchmark datasets, per-dataset + pooled)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_sentences(model, tokenizer, sentences, ds_label, num_layers):
-    """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}."""
+def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, band=None):
+    """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}.
+
+    ``band`` is an optional ``(layer_start, layer_end)`` mid-layer band (from
+    :func:`compute_band`); when ``None`` the fixed paper band (layers 4–11) is used.
+    """
+    ls, le = band if band is not None else (None, None)
     scores_mid = {key: [] for key, *_ in INTERVENTIONS}
     scores_all = {key: [] for key, *_ in INTERVENTIONS}
     n = len(sentences)
@@ -697,7 +720,8 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers):
         results = run_all_interventions(model, token_embeddings, pos_enc)
         for key, *_ in INTERVENTIONS:
             scores_mid[key].append(
-                compute_bos_attention_metric(results[key], num_layers, "mid")
+                compute_bos_attention_metric(results[key], num_layers, "mid",
+                                             layer_start=ls, layer_end=le)
             )
             scores_all[key].append(
                 compute_bos_attention_metric(results[key], num_layers, "all")
@@ -727,7 +751,8 @@ def _stats_rows(scores, ds_name):
 def dataset_analysis(model, tokenizer, output_dir,
                      sample_size=DEFAULT_SAMPLE_SIZE,
                      cut_length=DEFAULT_CUT_LENGTH,
-                     seed=DEFAULT_SEED):
+                     seed=DEFAULT_SEED,
+                     band=None):
     """Compute BOS-attention metric on three standard benchmarks.
 
     Datasets: SST-2 (natural language), GSM8K (math), HumanEval (code).
@@ -761,7 +786,7 @@ def dataset_analysis(model, tokenizer, output_dir,
         print(f"\n{'═'*60}")
         print(f"  Dataset: {ds_name}  ({len(sentences)} examples)")
         print(f"{'═'*60}")
-        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers)
+        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, band=band)
         all_mid[ds_name] = s_mid
         all_scope[ds_name] = s_all
 
@@ -853,15 +878,36 @@ def main():
         default=DEFAULT_SEED,
         help="Random seed for dataset sampling.",
     )
+    parser.add_argument(
+        "--layer-mode",
+        choices=["scaled", "fixed"],
+        default="scaled",
+        help="Mid-layer band for the BOS metric. 'scaled' (default) excludes the first 3 "
+             "and last layer (= layers 4-11 for a 12-layer model, so GPT-2 small is unchanged; "
+             "extends for deeper models); 'fixed' forces layers 4-11 on every size.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Model dtype. Default float32 (matches the paper's SEs); use a smaller dtype "
+             "only if VRAM-constrained on large models (e.g. gpt2-xl).",
+    )
     args = parser.parse_args()
 
-    print(f"Loading model: {args.model_name}...")
+    dtype = {"float32": torch.float32, "float16": torch.float16,
+             "bfloat16": torch.bfloat16}[args.dtype]
+    print(f"Loading model: {args.model_name} (dtype {args.dtype})...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GPT2LMHeadModel.from_pretrained(args.model_name, attn_implementation="eager")
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
     model.to(device)
+    model.to(dtype)
     model.eval()
-    print(f"Model loaded on {device}.\n")
+    num_layers = len(model.transformer.h)
+    band = compute_band(num_layers, args.layer_mode)
+    print(f"Model loaded on {device}. Layers: {num_layers}; mid-band [{band[0]}, {band[1]}) "
+          f"(layer-mode {args.layer_mode}).\n")
 
     if args.mode == "sentence":
         sentence_analysis(model, tokenizer, args.sentence, args.output_dir)
@@ -871,6 +917,7 @@ def main():
             sample_size=args.sample_size,
             cut_length=args.cut_length,
             seed=args.seed,
+            band=band,
         )
 
 

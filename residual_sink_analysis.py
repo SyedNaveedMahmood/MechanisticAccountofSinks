@@ -67,6 +67,7 @@ from intervention_analysis import (
     run_intervention_loop,
     manual_self_attention_new,
     compute_bos_attention_metric,
+    compute_band,
     LAYER_RANGE_START,
     LAYER_RANGE_END,
 )
@@ -85,12 +86,12 @@ RELOCATION_POS = 1    # swap target (0-indexed; paper's "position 2")
 # Model / embedding helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_model(model_name, device):
+def load_model(model_name, device, dtype=torch.float32):
     model = GPT2LMHeadModel.from_pretrained(model_name, attn_implementation="eager")
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     model.to(device)
     model.eval()
-    model.to(torch.float32)  # match the paper's tight SEs (fp32)
+    model.to(dtype)  # default fp32 to match the paper's SEs; smaller dtype for large XL runs
     return model, tokenizer
 
 
@@ -99,15 +100,21 @@ def compute_ppes(model, pos_enc):
     return pos_enc.clone()[0] + model.transformer.h[0].mlp(pos_enc.clone())[0]
 
 
-def identify_massive_coords(model, device, n_std=3.0):
-    """Coordinates of EPE_1 whose |value| exceeds mean+n_std·std (paper: 138,378,447)."""
+def identify_massive_coords(model, device, n_std=3.0, min_coords=3):
+    """Coordinates of EPE_1 whose |value| exceeds mean+n_std·std (paper: 138,378,447).
+
+    Falls back to the ``min_coords`` largest-|EPE_1| dimensions if fewer than
+    ``min_coords`` exceed the threshold, so the massive-coordinate knobs are
+    well-defined on every checkpoint (matches the paper's top-3 intervention).
+    """
     with torch.no_grad():
         pe0 = model.transformer.wpe(torch.tensor([[0]], device=device))
         epe0 = pe0[0, 0] + model.transformer.h[0].mlp(pe0)[0, 0]
-    vals = epe0.detach().cpu().numpy()
-    a = np.abs(vals)
-    mask = a > (a.mean() + n_std * a.std())
-    return np.where(mask)[0].tolist()
+    a = np.abs(epe0.detach().cpu().float().numpy())
+    coords = np.where(a > (a.mean() + n_std * a.std()))[0].tolist()
+    if len(coords) < min_coords:
+        coords = np.argsort(a)[-min_coords:][::-1].tolist()
+    return coords
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -205,8 +212,10 @@ def _pe_scale_first(alpha):
     return _t
 
 
-def bos_metric(attn_weights, num_layers, target_pos=SINK_POS):
-    return compute_bos_attention_metric(attn_weights, num_layers, "mid", target_pos=target_pos)
+def bos_metric(attn_weights, num_layers, target_pos=SINK_POS, band=None):
+    ls, le = band if band is not None else (None, None)
+    return compute_bos_attention_metric(attn_weights, num_layers, "mid",
+                                        target_pos=target_pos, layer_start=ls, layer_end=le)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -383,7 +392,7 @@ def count_examples(sampled):
 # E4.1 — Dose-response
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_dose_response(model, tokenizer, sampled, alphas, massive_coords):
+def run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=None):
     """BOS-attention vs α for three knobs. Returns a tidy DataFrame (one row per α×knob).
 
     Knobs are driven at an *effective* locus (see the module header on why layer-0-only
@@ -403,12 +412,12 @@ def run_dose_response(model, tokenizer, sampled, alphas, massive_coords):
     ):
         for a in alphas:
             acc[("scale_bq", a)].append(
-                bos_metric(run_config(model, te, pe, scale_bq=a), num_layers))
+                bos_metric(run_config(model, te, pe, scale_bq=a), num_layers, band=band))
             acc[("scale_pe", a)].append(
-                bos_metric(run_config(model, te, pe, pe_transform=_pe_scale_first(a)), num_layers))
+                bos_metric(run_config(model, te, pe, pe_transform=_pe_scale_first(a)), num_layers, band=band))
             acc[("scale_wk_massive", a)].append(
                 bos_metric(run_config(model, te, pe,
-                                      wk_scale_coords=massive_coords, wk_scale=a), num_layers))
+                                      wk_scale_coords=massive_coords, wk_scale=a), num_layers, band=band))
 
     rows = []
     for (knob, a), vals in acc.items():
@@ -422,17 +431,19 @@ def run_dose_response(model, tokenizer, sampled, alphas, massive_coords):
 # E4.2 — Decomposition + query alignment
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_decomposition(model, tokenizer, sampled, assert_identity=False):
+def run_decomposition(model, tokenizer, sampled, assert_identity=False, band=None):
     """Aggregate the per-(layer,head) decomposition and alignment across all examples."""
     per_example = {k: [] for k in
                    ("attn_full", "attn_content", "attn_delta", "share_delta", "align_red", "align_blue")}
+    ls, le = band if band is not None else (LAYER_RANGE_START, LAYER_RANGE_END)
     first = assert_identity
     for _ds, _ids, te, pe in tqdm(
         iter_examples(model, tokenizer, sampled),
         total=count_examples(sampled),
         desc="decomposition examples",
     ):
-        stats = collect_decomposition_and_alignment(model, te, pe, assert_identity=first)
+        stats = collect_decomposition_and_alignment(model, te, pe, layer_start=ls, layer_end=le,
+                                                    assert_identity=first)
         first = False  # assert once is enough
         for k in per_example:
             per_example[k].append(stats[k])
@@ -476,7 +487,7 @@ def _combined_and_surgical_specs(model, massive_coords):
     return specs
 
 
-def run_intervention_set(model, tokenizer, sampled, names, specs):
+def run_intervention_set(model, tokenizer, sampled, names, specs, band=None):
     """Run a named set of interventions, returning per-name BOS-attention (% of baseline)."""
     num_layers = len(model.transformer.h)
     acc = {n: [] for n in names}
@@ -486,7 +497,7 @@ def run_intervention_set(model, tokenizer, sampled, names, specs):
         desc="intervention examples",
     ):
         for n in names:
-            acc[n].append(bos_metric(specs[n](te, pe), num_layers))
+            acc[n].append(bos_metric(specs[n](te, pe), num_layers, band=band))
     means = {n: float(np.mean(v)) for n, v in acc.items()}
     base = means.get("baseline", 1.0) or 1.0
     return pd.DataFrame([
@@ -499,7 +510,7 @@ def run_intervention_set(model, tokenizer, sampled, names, specs):
 # E4.5 — Relocation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_relocation(model, tokenizer, sampled):
+def run_relocation(model, tokenizer, sampled, band=None):
     """Attention to position 0 (sink) and position 1 (swap target) under Swap-EPE and b∧d."""
     num_layers = len(model.transformer.h)
     acc = {k: [] for k in ("base_pos0", "base_pos1",
@@ -514,12 +525,12 @@ def run_relocation(model, tokenizer, sampled):
         base = run_config(model, te, pe)
         swap = run_config(model, te, pe, mlp_modify=make_swap_direction(*hats))
         bq0swap = run_config(model, te, pe, nullify_bq=True, mlp_modify=make_swap_direction(*hats))
-        acc["base_pos0"].append(bos_metric(base, num_layers, SINK_POS))
-        acc["base_pos1"].append(bos_metric(base, num_layers, RELOCATION_POS))
-        acc["swap_pos0"].append(bos_metric(swap, num_layers, SINK_POS))
-        acc["swap_pos1"].append(bos_metric(swap, num_layers, RELOCATION_POS))
-        acc["bq0swap_pos0"].append(bos_metric(bq0swap, num_layers, SINK_POS))
-        acc["bq0swap_pos1"].append(bos_metric(bq0swap, num_layers, RELOCATION_POS))
+        acc["base_pos0"].append(bos_metric(base, num_layers, SINK_POS, band=band))
+        acc["base_pos1"].append(bos_metric(base, num_layers, RELOCATION_POS, band=band))
+        acc["swap_pos0"].append(bos_metric(swap, num_layers, SINK_POS, band=band))
+        acc["swap_pos1"].append(bos_metric(swap, num_layers, RELOCATION_POS, band=band))
+        acc["bq0swap_pos0"].append(bos_metric(bq0swap, num_layers, SINK_POS, band=band))
+        acc["bq0swap_pos1"].append(bos_metric(bq0swap, num_layers, RELOCATION_POS, band=band))
     means = {k: float(np.mean(v)) for k, v in acc.items()}
     means["relocation_ratio_swap"] = (
         (means["swap_pos1"] - means["base_pos1"]) / (means["base_pos0"] + 1e-9))
@@ -634,30 +645,30 @@ def _seed_dir(root, seed):
     return root / f"seed_{seed:03d}"
 
 
-def run_all_modes(model, tokenizer, sampled, modes, alphas, massive_coords, with_perplexity):
+def run_all_modes(model, tokenizer, sampled, modes, alphas, massive_coords, with_perplexity, band=None):
     """Run the requested modes for one seed; return a dict of results (DataFrames / arrays)."""
     res = {}
     if "dose_response" in modes:
         print("Running mode: dose_response")
-        res["dose_response"] = run_dose_response(model, tokenizer, sampled, alphas, massive_coords)
+        res["dose_response"] = run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=band)
     if "decomposition" in modes:
         print("Running mode: decomposition")
-        res["decomposition"] = run_decomposition(model, tokenizer, sampled, assert_identity=True)
+        res["decomposition"] = run_decomposition(model, tokenizer, sampled, assert_identity=True, band=band)
     if "combined" in modes or "surgical" in modes:
         specs = _combined_and_surgical_specs(model, massive_coords)
         if "combined" in modes:
             print("Running mode: combined")
             names = ["baseline", "nullify_bq", "bq0__remove_first_pe", "bq0__zero_top3_wk",
                      "bq0__swap_epe", "bq0__zero_top3_wk__swap_epe"]
-            res["combined"] = run_intervention_set(model, tokenizer, sampled, names, specs)
+            res["combined"] = run_intervention_set(model, tokenizer, sampled, names, specs, band=band)
         if "surgical" in modes:
             print("Running mode: surgical")
             names = ["baseline", "first_layer_mlp_skip", "all_layer_no_mlp",
                      "pos1_only_pe_zero", "all_pos_no_pe"]
-            res["surgical"] = run_intervention_set(model, tokenizer, sampled, names, specs)
+            res["surgical"] = run_intervention_set(model, tokenizer, sampled, names, specs, band=band)
     if "relocation" in modes:
         print("Running mode: relocation")
-        res["relocation"] = run_relocation(model, tokenizer, sampled)
+        res["relocation"] = run_relocation(model, tokenizer, sampled, band=band)
     if with_perplexity or "perplexity" in modes:
         print("Running mode: perplexity")
         res["perplexity"] = run_perplexity(model, tokenizer, sampled, massive_coords)
@@ -790,6 +801,13 @@ def main():
     parser.add_argument("--cut-length", type=int, default=DEFAULT_CUT_LENGTH)
     parser.add_argument("--alphas", default=None,
                         help="Comma-separated dose-response scale factors. Default: 0..1.5 step .25")
+    parser.add_argument("--layer-mode", choices=["scaled", "fixed"], default="scaled",
+                        help="Mid-layer band. 'scaled' (default) excludes the first 3 and last layer "
+                             "(= layers 4-11 for the 12-layer small model, extends for deeper models); "
+                             "'fixed' forces layers 4-11 on every size.")
+    parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32",
+                        help="Model dtype. Default float32 (matches the paper's SEs); use a smaller "
+                             "dtype only if VRAM-constrained on large XL runs.")
     parser.add_argument("--with-perplexity", action="store_true",
                         help="Also compute the optional E4.6 LM-loss table.")
     parser.add_argument("--plot-only", action="store_true",
@@ -806,11 +824,23 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
 
     if not args.plot_only:
+        dtype = {"float32": torch.float32, "float16": torch.float16,
+                 "bfloat16": torch.bfloat16}[args.dtype]
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Loading {args.model_name} on {device} ...")
-        model, tokenizer = load_model(args.model_name, device)
+        print(f"Loading {args.model_name} on {device} (dtype {args.dtype}) ...")
+        model, tokenizer = load_model(args.model_name, device, dtype=dtype)
+        num_layers = len(model.transformer.h)
+        band = compute_band(num_layers, args.layer_mode)
         massive_coords = identify_massive_coords(model, device)
+        print(f"Layers: {num_layers}  |  mid-band [{band[0]}, {band[1]})  |  layer-mode {args.layer_mode}")
         print(f"Massive-activation coordinates of EPE_1: {massive_coords}")
+
+        run_meta = {
+            "model_name": args.model_name, "dtype": args.dtype, "layer_mode": args.layer_mode,
+            "band_start": band[0], "band_end": band[1], "num_layers": num_layers,
+            "massive_coords": massive_coords, "alphas": alphas,
+            "sample_size": args.sample_size, "cut_length": args.cut_length,
+        }
 
         for seed in seeds:
             print(f"\n{'='*70}\nSeed {seed}: sampling + running modes {modes}\n{'='*70}")
@@ -820,8 +850,9 @@ def main():
             out_dir = _seed_dir(root, seed)
             out_dir.mkdir(parents=True, exist_ok=True)
             pd.DataFrame(manifest).to_csv(out_dir / "sample_manifest.csv", index=False)
+            (out_dir / "run_config.json").write_text(json.dumps({**run_meta, "seed": seed}, indent=2))
             res = run_all_modes(model, tokenizer, sampled, modes, alphas,
-                                massive_coords, args.with_perplexity)
+                                massive_coords, args.with_perplexity, band=band)
             save_seed_results(res, out_dir)
             print(f"Seed {seed} outputs → {out_dir}")
 
