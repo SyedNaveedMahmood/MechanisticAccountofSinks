@@ -101,6 +101,8 @@ def manual_self_attention_new(hidden_states, layer,
                               intervene_query_bias=False,
                               query_bias_scale=1.0,
                               fixed_wk_zero_indices=None,
+                              wk_scale_indices=None,
+                              wk_scale=1.0,
                               random_wk_zero_rows=False):
     """
     Manual implementation of the self-attention mechanism for a single GPT-2 layer.
@@ -114,6 +116,10 @@ def manual_self_attention_new(hidden_states, layer,
             (used for the dose-response sweep; 1.0 = unchanged, 0.0 = nullified).
             Ignored when ``intervene_query_bias`` is True (which forces bq = 0).
         fixed_wk_zero_indices (list or None): If a list of indices is provided, zero out these columns in Wk.
+        wk_scale_indices (list or None): If provided, multiply these Wk columns by ``wk_scale``
+            in every layer (graded version of the Zero-Top-3-Wk intervention, used for the
+            coordinate-channel dose-response; wk_scale=1.0 leaves Wk unchanged, 0.0 zeroes them).
+        wk_scale (float): Scale applied to the ``wk_scale_indices`` columns of Wk.
         random_wk_zero_rows (bool): If True, zero out 3 random columns in Wk.
 
     Returns:
@@ -174,6 +180,9 @@ def manual_self_attention_new(hidden_states, layer,
         # Generate random indices to zero out
         random_indices_to_zero = [random.randint(0, hidden_size - 1) for _ in range(3)]
         wk_active[:, random_indices_to_zero] = 0.0
+    # Graded scaling of specified Wk columns (coordinate-channel dose-response, every layer)
+    if wk_scale_indices is not None and wk_scale != 1.0:
+        wk_active[:, wk_scale_indices] = wk_scale * wk_active[:, wk_scale_indices]
 
 
     # Project input to QKV

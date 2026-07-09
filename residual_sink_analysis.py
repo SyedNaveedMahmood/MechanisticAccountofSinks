@@ -20,8 +20,14 @@ is driven by T1 (content) + T3 (source-agnostic shift) only.
 
 Modes
 -----
-  dose_response   E4.1  BOS-attention vs scale α on three knobs (b_Q, EPE_1 direction,
-                        massive coords). The differing α=0 floors are the two-pathway signature.
+  dose_response   E4.1  BOS-attention vs scale α on three knobs: b_Q (pathway A); p_1, the
+                        position-0 PE that is the EPE_1 source (both pathways); and the top-3
+                        W_k massive columns (coordinate channel, graded every layer). The
+                        differing α=0 floors are the two-pathway signature. NOTE: the knobs act
+                        at the input (p_1) or in every layer (W_k), NOT on the layer-0 MLP output
+                        only — a layer-0-only edit is inert because the massive activations at
+                        position 0 are re-established by the intermediate layers (paper fn. 10)
+                        before the metric window (layers 4-11).
   decomposition   E4.2  Exact T1/T3 attribution of the position-1 advantage + the
                         query–EPE_1 alignment histogram (Fig. 2 analog for downstream queries).
   combined        E4.3  Stacked interventions (b∧c, b∧i, b∧d, b∧i∧d) localizing the residual.
@@ -109,24 +115,13 @@ def identify_massive_coords(model, device, n_std=3.0):
 # Each mirrors the closure style of intervention_d/e in intervention_analysis.py.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def make_scale_epe_direction(alpha, epe0_hat):
-    """Scale the EPE_1-direction component of the layer-0 MLP output at position 0 by α."""
-    def _modify(layer_idx, mlp_output):
-        if layer_idx == 0:
-            comp = torch.dot(mlp_output[0][0], epe0_hat)
-            mlp_output[0][0] = mlp_output[0][0] + (alpha - 1.0) * comp * epe0_hat
-        return mlp_output
-    return _modify
-
-
-def make_scale_massive_coords(alpha, coords):
-    """Scale the massive-activation coordinates of the layer-0 MLP output at position 0 by α."""
-    coords = list(coords)
-    def _modify(layer_idx, mlp_output):
-        if layer_idx == 0:
-            mlp_output[0][0, coords] = alpha * mlp_output[0][0, coords]
-        return mlp_output
-    return _modify
+# NOTE: earlier versions grafted the EPE_1 / massive-coordinate dose-response onto the
+# *layer-0 MLP output* (via modify_mlp_fn). Empirically those knobs were inert (flat BOS
+# attention across alpha) because the massive activations at position 0 are re-established
+# by the intermediate layers (1-3) before the metric window (layers 4-11) — the same
+# effect the paper notes in fn. 10. The dose-response therefore drives these components at
+# an *effective* locus instead: p_1 at the input (run_config pe_transform=_pe_scale_first)
+# and the top-3 W_k columns in every layer (run_config wk_scale_coords/wk_scale).
 
 
 def make_swap_direction(u0_hat, u1_hat):
@@ -155,6 +150,7 @@ def make_zero_layer0_mlp():
 
 def run_config(model, token_embeddings, pos_enc, *,
                nullify_bq=False, scale_bq=None, wk_zero_coords=None,
+               wk_scale_coords=None, wk_scale=1.0,
                mlp_modify=None, skip_mlp=False, pe_transform=None):
     """Run one (possibly combined) intervention and return per-layer attention weights.
 
@@ -174,6 +170,9 @@ def run_config(model, token_embeddings, pos_enc, *,
         attn_kwargs["query_bias_scale"] = scale_bq
     if wk_zero_coords is not None:
         attn_kwargs["fixed_wk_zero_indices"] = list(wk_zero_coords)
+    if wk_scale_coords is not None:
+        attn_kwargs["wk_scale_indices"] = list(wk_scale_coords)
+        attn_kwargs["wk_scale"] = wk_scale
 
     return run_intervention_loop(
         model, layer_input, ppes,
@@ -191,6 +190,19 @@ def _pe_zero_first(pe):
     """Surgical: zero the positional embedding at position 0 only."""
     pe[0][0] = torch.zeros_like(pe[0][0])
     return pe
+
+
+def _pe_scale_first(alpha):
+    """Input-level EPE_1 source knob: scale the position-0 PE (p_1) by alpha.
+
+    alpha=1 is baseline; alpha=0 removes the positional signal at position 0 (≈ the
+    Remove-First-PE / No-PE-at-position-0 floor), collapsing *both* pathways since both
+    depend on EPE_1 = MLP(p_1) + p_1.
+    """
+    def _t(pe):
+        pe[0][0] = alpha * pe[0][0]
+        return pe
+    return _t
 
 
 def bos_metric(attn_weights, num_layers, target_pos=SINK_POS):
@@ -372,9 +384,16 @@ def count_examples(sampled):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_dose_response(model, tokenizer, sampled, alphas, massive_coords):
-    """BOS-attention vs α for three knobs. Returns a tidy DataFrame (one row per α×knob)."""
+    """BOS-attention vs α for three knobs. Returns a tidy DataFrame (one row per α×knob).
+
+    Knobs are driven at an *effective* locus (see the module header on why layer-0-only
+    edits wash out):
+      scale_bq         : scale the query bias b_Q             — pathway A; floors at the residual
+      scale_pe         : scale the position-0 PE p_1 (input)  — EPE_1 source, both pathways; floors low
+      scale_wk_massive : scale the top-3 W_k columns (every layer) — coordinate channel; grades Zero-Top-3-Wk
+    """
     num_layers = len(model.transformer.h)
-    knobs = ["scale_bq", "scale_epe_dir", "scale_massive"]
+    knobs = ["scale_bq", "scale_pe", "scale_wk_massive"]
     acc = {(k, a): [] for k in knobs for a in alphas}
 
     for _ds, _ids, te, pe in tqdm(
@@ -382,17 +401,14 @@ def run_dose_response(model, tokenizer, sampled, alphas, massive_coords):
         total=count_examples(sampled),
         desc="dose_response examples",
     ):
-        ppes = compute_ppes(model, pe)
-        epe0_hat = ppes[0] / torch.linalg.norm(ppes[0])
         for a in alphas:
             acc[("scale_bq", a)].append(
                 bos_metric(run_config(model, te, pe, scale_bq=a), num_layers))
-            acc[("scale_epe_dir", a)].append(
+            acc[("scale_pe", a)].append(
+                bos_metric(run_config(model, te, pe, pe_transform=_pe_scale_first(a)), num_layers))
+            acc[("scale_wk_massive", a)].append(
                 bos_metric(run_config(model, te, pe,
-                                      mlp_modify=make_scale_epe_direction(a, epe0_hat)), num_layers))
-            acc[("scale_massive", a)].append(
-                bos_metric(run_config(model, te, pe,
-                                      mlp_modify=make_scale_massive_coords(a, massive_coords)), num_layers))
+                                      wk_scale_coords=massive_coords, wk_scale=a), num_layers))
 
     rows = []
     for (knob, a), vals in acc.items():
@@ -546,15 +562,15 @@ def run_perplexity(model, tokenizer, sampled, massive_coords):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 KNOB_LABELS = {
-    "scale_bq": r"Scale $b_Q$ (pathway A)",
-    "scale_epe_dir": r"Scale EPE$_1$ direction (shared)",
-    "scale_massive": r"Scale massive coords (shared)",
+    "scale_bq": r"Scale $b_Q$ (pathway A: bias)",
+    "scale_pe": r"Scale $p_1$ (EPE$_1$ source: both pathways)",
+    "scale_wk_massive": r"Scale top-3 $W_k$ columns (coordinate channel)",
 }
 
 
 def plot_dose_response(df_mean, df_std, save_path, baseline=None):
     fig, ax = plt.subplots(figsize=(7.5, 5))
-    for knob in ["scale_bq", "scale_epe_dir", "scale_massive"]:
+    for knob in ["scale_bq", "scale_pe", "scale_wk_massive"]:
         m = df_mean[df_mean["knob"] == knob].sort_values("alpha")
         y = m["bos_attention"].values
         x = m["alpha"].values
