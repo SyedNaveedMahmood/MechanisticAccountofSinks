@@ -297,7 +297,15 @@ def _decompose_layer(normalized, layer, ppes, H, Dh, scale, device, assert_ident
         k_f = (h0 @ wk.t() + bk).view(seq, H, Dh)
         full_ref = torch.einsum("ihd,jhd->hij", q_f, k_f)
         max_err = (full - full_ref).abs().max().item()
-        assert max_err < 1e-3, f"score decomposition identity failed: {max_err}"
+        # Relative tolerance: once the massive-activation circuit forms, coordinate values reach
+        # the hundreds and the pre-softmax scores reach ~1e4, so a fixed 1e-3 *absolute* bound
+        # false-positives on trained checkpoints even though the identity holds to fp32 precision
+        # (observed relative error ~1e-7 = a single ulp). Scale by the score magnitude, keeping a
+        # 1e-3 absolute floor for the small-score (early-training / random-init) regime.
+        ref_scale = full_ref.abs().max().item()
+        tol = 1e-4 * ref_scale + 1e-3
+        assert max_err < tol, (
+            f"score decomposition identity failed: {max_err} (tol {tol:.3g}, ref scale {ref_scale:.3g})")
 
     # Causal mask (True where target j <= source i)
     mask = torch.tril(torch.ones(seq, seq, device=device)).bool()

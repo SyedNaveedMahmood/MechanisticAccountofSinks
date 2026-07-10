@@ -45,8 +45,12 @@ import argparse
 import gc
 import itertools
 import json
+import os
 import re
+import shutil
 from pathlib import Path
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # quiet the Windows no-symlink notice
 
 import matplotlib
 matplotlib.use("Agg")
@@ -195,21 +199,35 @@ def select_checkpoints(available, targets, n=None):
 
 
 def purge_revision_cache(repo_id, revision):
-    """Delete just this (repo, revision)'s cached blobs to bound peak disk (~1 checkpoint)."""
+    """Best-effort, quiet deletion of a (repo, revision)'s cached files to bound peak disk.
+
+    Deliberately avoids ``huggingface_hub.delete_revisions().execute()`` which spams per-blob
+    tracebacks on Windows (where the cache uses file copies instead of symlinks). Instead we
+    remove the revision's blobs, snapshot dir, and ref file directly with ``ignore_errors`` /
+    try-except, so cache cleanup never crashes the run or floods the log.
+    """
     try:
         from huggingface_hub import scan_cache_dir
         cache = scan_cache_dir()
-        to_delete = []
-        for repo in cache.repos:
-            if repo.repo_id != repo_id:
+    except Exception:
+        return
+    for repo in cache.repos:
+        if repo.repo_id != repo_id:
+            continue
+        repo_path = Path(repo.repo_path)
+        for rev in repo.revisions:
+            if revision not in set(rev.refs):
                 continue
-            for rev in repo.revisions:
-                if revision in set(rev.refs):
-                    to_delete.append(rev.commit_hash)
-        if to_delete:
-            cache.delete_revisions(*to_delete).execute()
-    except Exception as e:  # never let cache cleanup crash a run
-        print(f"  [purge] skipped for {repo_id}@{revision}: {e}")
+            for f in rev.files:                      # real bytes (blobs; also the copies on Windows)
+                try:
+                    Path(f.blob_path).unlink()
+                except Exception:
+                    pass
+            shutil.rmtree(repo_path / "snapshots" / rev.commit_hash, ignore_errors=True)
+            try:
+                (repo_path / "refs" / revision).unlink()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -696,6 +714,11 @@ def run_experiment(args, root, modes):
     dtype = {"float32": torch.float32, "float16": torch.float16,
              "bfloat16": torch.bfloat16}[args.dtype]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        print(f"Device: cuda ({torch.cuda.get_device_name(0)}), dtype {args.dtype}")
+    else:
+        print("Device: CPU  [WARNING] CUDA not detected — this will be ~50-100x slower than a GPU. "
+              "Install the CUDA build of torch (torch==2.10.0+cu128) to use the 4080 Super.")
     runs = resolve_runs(args)
     targets = ([int(s) for s in args.checkpoints.split(",")]
                if args.checkpoints not in (None, "auto") else DEFAULT_TARGET_STEPS)
