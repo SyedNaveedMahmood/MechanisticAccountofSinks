@@ -149,8 +149,17 @@ def load_checkpoint(model_name, device, dtype=torch.float32, revision=None, cach
     extractable. Tokenizer falls back to the base gpt2 BPE (identical vocab across Mistral runs)
     if the checkpoint repo ships no tokenizer files.
     """
-    model = GPT2LMHeadModel.from_pretrained(
-        model_name, revision=revision, cache_dir=cache_dir, attn_implementation="eager")
+    load_kw = dict(revision=revision, cache_dir=cache_dir, attn_implementation="eager")
+    # Prefer safetensors, fall back to the .bin weights. Passing use_safetensors *explicitly*
+    # (never leaving it None) stops transformers from spawning its background "auto_conversion"
+    # thread, which tries to open a safetensors-conversion PR for the Mistral .bin-only
+    # checkpoints and dies with a harmless-but-alarming OSError traceback (it does NOT stop the
+    # run, but it looks like a crash). Preferring safetensors also skips the larger .bin download
+    # when both formats are present.
+    try:
+        model = GPT2LMHeadModel.from_pretrained(model_name, use_safetensors=True, **load_kw)
+    except Exception:
+        model = GPT2LMHeadModel.from_pretrained(model_name, use_safetensors=False, **load_kw)
     try:
         tokenizer = GPT2Tokenizer.from_pretrained(model_name, revision=revision, cache_dir=cache_dir)
     except Exception:
