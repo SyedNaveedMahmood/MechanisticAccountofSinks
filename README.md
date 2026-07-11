@@ -327,8 +327,9 @@ token-ID prefixes, so decoding cannot alter lengths and independently resampled 
 cannot confound scaling. The random-`W_k` control uses fixed coordinates selected by
 `--random-wk-seed` and records them in `run_config.json`. Optional Bangla/Chinese
 FLORES data is loaded only with `--with-multilingual` and skips gracefully when
-unavailable. See [`.md/E5.md`](.md/E5.md) for metric definitions, cache layout,
-four-GPU commands, runtime/RAM guidance, and the verification protocol.
+unavailable. See [`.md/E5.md`](.md/E5.md) for the scientific protocol and
+[`.md/E5_IMPLEMENTATION_GUIDE.md`](.md/E5_IMPLEMENTATION_GUIDE.md) for setup,
+commands, cache merging, output interpretation, and troubleshooting.
 
 ## Cross-scale runs (all harnesses)
 
