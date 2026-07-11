@@ -260,7 +260,8 @@ def collect_decomposition_and_alignment(model, token_embeddings, pos_enc,
                 out[k].append(stats[k])
 
         # advance the (baseline) forward pass exactly as run_intervention_loop does
-        attn_out, *_ = manual_self_attention_new(normalized, layer, ppes=ppes)
+        attn_out, *_ = manual_self_attention_new(normalized, layer, ppes=ppes,
+                                                 compute_diagnostics=False)
         attn_res = layer_input + attn_out
         mlp_out = layer.mlp(layer.ln_2(attn_res))
         layer_input = attn_res + mlp_out
@@ -359,7 +360,8 @@ def forward_to_logits(model, token_embeddings, pos_enc, *, attn_kwargs=None,
     ppes = compute_ppes(model, pos_enc)
     for li, layer in enumerate(model.transformer.h):
         normalized = layer.ln_1(layer_input.clone())
-        attn_out, *_ = manual_self_attention_new(normalized, layer, ppes=ppes, **attn_kwargs)
+        attn_out, *_ = manual_self_attention_new(normalized, layer, ppes=ppes,
+                                                 compute_diagnostics=False, **attn_kwargs)
         attn_res = layer_input + attn_out
         if skip_mlp:
             layer_input = attn_res
