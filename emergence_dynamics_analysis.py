@@ -141,32 +141,39 @@ ONSET_SIGNALS = ["sink_strength", "epe1_max_abs", "align_bias_pos0",
 # Checkpoint loading (the one net-new capability) + Hub discovery
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_checkpoint(model_name, device, dtype=torch.float32, revision=None, cache_dir=None):
+def load_checkpoint(model_name, device, dtype=torch.float32, revision=None, cache_dir=None,
+                    load_tokenizer=True):
     """Load a GPT-2 checkpoint at an optional HF ``revision`` (e.g. 'checkpoint-1000').
 
     No other harness in the repo threads ``revision``; that is the whole reason E3 needs a
     bespoke loader. ``attn_implementation="eager"`` is mandatory so attention weights are
-    extractable. Tokenizer falls back to the base gpt2 BPE (identical vocab across Mistral runs)
-    if the checkpoint repo ships no tokenizer files.
+    extractable.
+
+    Set ``load_tokenizer=False`` to skip the tokenizer download: every Mistral run shares the
+    base gpt2 BPE, so the sweep loads one gpt2 tokenizer up front and reuses it across all
+    checkpoints. That avoids ~4 tokenizer-file downloads per checkpoint — anonymous, rate-limited
+    requests that were the step observed hanging mid-run.
     """
     load_kw = dict(revision=revision, cache_dir=cache_dir, attn_implementation="eager")
-    # Prefer safetensors, fall back to the .bin weights. Passing use_safetensors *explicitly*
-    # (never leaving it None) stops transformers from spawning its background "auto_conversion"
-    # thread, which tries to open a safetensors-conversion PR for the Mistral .bin-only
-    # checkpoints and dies with a harmless-but-alarming OSError traceback (it does NOT stop the
-    # run, but it looks like a crash). Preferring safetensors also skips the larger .bin download
-    # when both formats are present.
+    # Load the .bin weights directly (use_safetensors=False) FIRST. On a .bin-only checkpoint,
+    # *asking* for safetensors is what makes transformers spawn its background "auto_conversion"
+    # thread — it tries to open a .bin->safetensors conversion PR on the Hub and dies with an
+    # alarming (but harmless, non-fatal) OSError traceback. Explicit False never asks, so the
+    # thread is not spawned; we only fall back to safetensors for the rare safetensors-only
+    # revision, where they already exist and no conversion is attempted.
     try:
-        model = GPT2LMHeadModel.from_pretrained(model_name, use_safetensors=True, **load_kw)
-    except Exception:
         model = GPT2LMHeadModel.from_pretrained(model_name, use_safetensors=False, **load_kw)
-    try:
-        tokenizer = GPT2Tokenizer.from_pretrained(model_name, revision=revision, cache_dir=cache_dir)
     except Exception:
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        model = GPT2LMHeadModel.from_pretrained(model_name, use_safetensors=True, **load_kw)
     model.to(device)
     model.eval()
     model.to(dtype)
+    tokenizer = None
+    if load_tokenizer:
+        try:
+            tokenizer = GPT2Tokenizer.from_pretrained(model_name, revision=revision, cache_dir=cache_dir)
+        except Exception:
+            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     return model, tokenizer
 
 
@@ -734,7 +741,7 @@ def run_experiment(args, root, modes):
 
     # Fixed evaluation sample (identical across every run + checkpoint). Uses the base gpt2 BPE,
     # which every Mistral run shares, so the 300 examples are literally the same tokens everywhere.
-    sampled = manifest = None
+    sampled = manifest = sampling_tok = None
     if DATA_MODES & set(modes):
         sampling_tok = GPT2Tokenizer.from_pretrained(args.tokenizer_name)
         sampled, manifest = sample_benchmark_datasets(
@@ -755,10 +762,11 @@ def run_experiment(args, root, modes):
             out_dir = _ckpt_dir(root, run_id, step)
             if args.skip_existing and (out_dir / "metrics.json").exists():
                 continue
-            model, tokenizer = load_checkpoint(run_id, device, dtype=dtype, revision=revision)
+            model, _ = load_checkpoint(run_id, device, dtype=dtype, revision=revision,
+                                       load_tokenizer=False)  # reuse the one gpt2 tokenizer below
             num_layers = len(model.transformer.h)
             band = compute_band(num_layers, args.layer_mode)
-            row = measure_checkpoint(model, tokenizer, sampled, device, band, modes, args.cut_length)
+            row = measure_checkpoint(model, sampling_tok, sampled, device, band, modes, args.cut_length)
             row.update({"run": _run_short(run_id), "run_id": run_id, "step": int(step),
                         "revision": revision})
             out_dir.mkdir(parents=True, exist_ok=True)
