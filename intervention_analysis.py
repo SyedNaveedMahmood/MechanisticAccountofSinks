@@ -135,7 +135,8 @@ def manual_self_attention_new(hidden_states, layer,
             - value_of_dot_product_against_attention_unmasked (list): Dot product values.
             - similarities_ppes_bq (list): Cosine similarities related to ppes and bq.
             - similarities_rows_of_wk (list): Similarities related to rows of Wk.
-            - bq_Wk (list): bq and wk (modified if interventions applied).
+            - bq_Wk (list): bq and wk (modified if interventions applied). Diagnostic
+              entries are ``None`` when ``compute_diagnostics=False``.
     """
     # Get attention layer parameters
     attn_layer = layer.attn
@@ -159,18 +160,18 @@ def manual_self_attention_new(hidden_states, layer,
     elif query_bias_scale != 1.0:
         bq = query_bias_scale * bq
 
-    # Calculate Wq multiplied by Wk transposed
-    wq_wk_t_product = F.linear(wq, wk.t())
-
-    # Zero out all values except the top 3 in the first token of layer_input
-    first_token_vector = abs(hidden_states[0][0].clone())
-    topk_values, topk_indices_local = torch.topk(first_token_vector, k=3) # Get top 3 absolute values and their indices
-    mask = torch.zeros_like(first_token_vector, dtype=torch.bool)
-    mask[topk_indices_local] = True
-    first_token_vector_masked = torch.zeros_like(first_token_vector)
-    first_token_vector_masked[mask] = first_token_vector[mask]
-    first_token_only_massive = first_token_vector_masked
-    result_vector = torch.matmul(wq_wk_t_product, first_token_only_massive).view(1, num_heads, 1, head_dim)
+    # ``result_vector`` is diagnostic-only.  In particular, avoid the hidden^2
+    # Wq@Wk product in dataset/long-context runs where callers discard it.
+    result_vector = None
+    if compute_diagnostics:
+        wq_wk_t_product = F.linear(wq, wk.t())
+        first_token_vector = hidden_states[0, 0].abs()
+        _, topk_indices_local = torch.topk(first_token_vector, k=3)
+        first_token_only_massive = torch.zeros_like(first_token_vector)
+        first_token_only_massive[topk_indices_local] = first_token_vector[topk_indices_local]
+        result_vector = torch.matmul(
+            wq_wk_t_product, first_token_only_massive
+        ).view(1, num_heads, 1, head_dim)
 
     # --- INTERVENTION E/F: Nullify massive/random activation columns in Wk ---
     wk_active = wk.clone() # Use a temporary variable for modifications
@@ -191,10 +192,10 @@ def manual_self_attention_new(hidden_states, layer,
     key_proj = F.linear(hidden_states, wk_active, bk) # Use wk_active
     value_proj = F.linear(hidden_states, wv, bv)
 
-    # Store query and key before reshaping
-    query_before_reshape = query_proj.clone()
-    key_before_reshape = key_proj.clone()
-    value_reshaped = value_proj.clone()
+    # Query/key clones are retained only for the legacy diagnostic API.  Tuple
+    # positions remain stable and contain None in the optimized path.
+    query_before_reshape = query_proj.clone() if compute_diagnostics else None
+    key_before_reshape = key_proj.clone() if compute_diagnostics else None
 
     # Diagnostic-only quantities (used solely by the single-sentence analysis / plotting paths).
     # These are Python-loop + per-element .detach() computations that force thousands of tiny
@@ -237,7 +238,7 @@ def manual_self_attention_new(hidden_states, layer,
 
     # Calculate attention scores (Q @ K^T)
     attention_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-    attention_scores_before_mask=attention_scores.clone()
+    attention_scores_before_mask = attention_scores.clone() if compute_diagnostics else None
 
     # Apply causal mask
     sequence_length = hidden_states.size(1)
@@ -268,7 +269,7 @@ def manual_self_attention_new(hidden_states, layer,
             wk_i = torch.matmul(one_hot_vector, wk_active.T)
             similarity = torch.abs(torch.dot(bq, wk_i).detach())
             similarities_rows_of_wk.append(similarity)
-    bq_Wk = [bq, wk_active] # Return the possibly modified wk_active
+    bq_Wk = [bq, wk_active] if compute_diagnostics else None
 
     return attention_output, attention_weights, query_before_reshape, key_before_reshape, \
            attention_scores_before_mask, result_vector, similarities_bq, \

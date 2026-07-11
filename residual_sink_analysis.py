@@ -160,17 +160,23 @@ def make_zero_layer0_mlp():
 def run_config(model, token_embeddings, pos_enc, *,
                nullify_bq=False, scale_bq=None, wk_zero_coords=None,
                wk_scale_coords=None, wk_scale=1.0,
-               mlp_modify=None, skip_mlp=False, pe_transform=None):
+               mlp_modify=None, skip_mlp=False, pe_transform=None,
+               te_transform=None):
     """Run one (possibly combined) intervention and return per-layer attention weights.
 
     Parameters mirror the paper's intervention vocabulary and stack freely, so
     combined interventions (E4.3) and dose-response knobs (E4.1) are one-liners.
     """
+    te = token_embeddings.clone()
+    if te_transform is not None:
+        te = te_transform(te)
     pe = pos_enc.clone()
     if pe_transform is not None:
         pe = pe_transform(pe)
-    layer_input = token_embeddings.clone() + pe
-    ppes = compute_ppes(model, pe)
+    layer_input = te + pe
+    # EPEs feed only legacy diagnostics in run_intervention_loop; those are
+    # disabled for every composable dataset run.
+    ppes = None
 
     attn_kwargs = {}
     if nullify_bq:
@@ -372,11 +378,19 @@ def _decompose_layer(normalized, layer, ppes, H, Dh, scale, device, assert_ident
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def forward_to_logits(model, token_embeddings, pos_enc, *, attn_kwargs=None,
-                      mlp_modify=None, skip_mlp=False):
+                      mlp_modify=None, skip_mlp=False, pe_transform=None,
+                      te_transform=None):
     """Manual forward returning LM logits, so the CE cost of an intervention is measurable."""
     attn_kwargs = attn_kwargs or {}
-    layer_input = token_embeddings.clone() + pos_enc.clone()
-    ppes = compute_ppes(model, pos_enc)
+    te = token_embeddings.clone()
+    pe = pos_enc.clone()
+    if te_transform is not None:
+        te = te_transform(te)
+    if pe_transform is not None:
+        pe = pe_transform(pe)
+    layer_input = te + pe
+    # EPEs feed only legacy diagnostics in manual attention, disabled here.
+    ppes = None
     for li, layer in enumerate(model.transformer.h):
         normalized = layer.ln_1(layer_input.clone())
         attn_out, *_ = manual_self_attention_new(normalized, layer, ppes=ppes,
