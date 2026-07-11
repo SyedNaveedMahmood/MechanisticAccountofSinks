@@ -301,6 +301,36 @@ Modes (each maps to a paper-ready deliverable):
 > regenerable from cached per-seed outputs via `--plot-only`. The massive-activation
 > coordinates (paper: 138, 378, 447) are re-identified per model at load time.
 
+## Extension — Evaluation Robustness & Functional Cost (E5)
+
+`evaluation_robustness_analysis.py` audits whether the Table 1 mechanism is robust
+to alternative sink metrics, context lengths through 1024 tokens, and synthetic or
+multilingual content, then measures the language-model cross-entropy cost of sink
+removal. One declarative intervention registry drives attention maps, metrics, CE,
+length tests, content controls, and parity checks, including all ten Table 1 rows,
+the four E4 combinations, and graded `b_Q`/PE dose responses.
+
+```bash
+# Complete GPT-2-small E5 suite (seeds 0,1,2; fp32 by default)
+python evaluation_robustness_analysis.py --mode all --model-name gpt2 --output-dir results
+
+# Rebuild every aggregate table and E5-A...F figure without model/dataset loading
+python evaluation_robustness_analysis.py --mode all --model-name gpt2 --plot-only --output-dir results
+
+# Offline random-model smoke test; real-model parity is a separate explicit check
+python evaluation_robustness_analysis.py --smoke-test --output-dir results/_e5_smoke
+python evaluation_robustness_analysis.py --verify-parity --model-name gpt2 --output-dir results/_e5_parity
+```
+
+Length comparisons use deterministic within-domain concatenation and paired nested
+token-ID prefixes, so decoding cannot alter lengths and independently resampled data
+cannot confound scaling. The random-`W_k` control uses fixed coordinates selected by
+`--random-wk-seed` and records them in `run_config.json`. Optional Bangla/Chinese
+FLORES data is loaded only with `--with-multilingual` and skips gracefully when
+unavailable. See [`.md/E5.md`](.md/E5.md) for the scientific protocol and
+[`.md/E5_IMPLEMENTATION_GUIDE.md`](.md/E5_IMPLEMENTATION_GUIDE.md) for setup,
+commands, cache merging, output interpretation, and troubleshooting.
+
 ## Cross-scale runs (all harnesses)
 
 Every intervention harness — GPT-2 (`intervention_analysis.py`), OPT
