@@ -103,7 +103,8 @@ def manual_self_attention_new(hidden_states, layer,
                               fixed_wk_zero_indices=None,
                               wk_scale_indices=None,
                               wk_scale=1.0,
-                              random_wk_zero_rows=False):
+                              random_wk_zero_rows=False,
+                              compute_diagnostics=True):
     """
     Manual implementation of the self-attention mechanism for a single GPT-2 layer.
 
@@ -195,29 +196,35 @@ def manual_self_attention_new(hidden_states, layer,
     key_before_reshape = key_proj.clone()
     value_reshaped = value_proj.clone()
 
-    # Recalculate k1, similarities_bq, etc. with the possibly modified wk_active
-    k1 = F.linear(hidden_states[0][0], wk_active, torch.zeros_like(bk))
-    dot_product_bq_k1 = torch.dot(bq, k1).detach()
-
+    # Diagnostic-only quantities (used solely by the single-sentence analysis / plotting paths).
+    # These are Python-loop + per-element .detach() computations that force thousands of tiny
+    # GPU->CPU syncs per call (a seq*seq loop plus a hidden-size loop); EVERY dataset / intervention
+    # caller discards them (``attn_out, *_ = ...``), so they are skipped when
+    # compute_diagnostics=False for a ~100x speedup with numerically identical attention output.
     similarities_bq = []
-    for l in range(len(hidden_states[0])):
-      kl = F.linear(hidden_states[0][l], wk_active, torch.zeros_like(bk))
-      similarity = torch.dot(bq, kl).detach()
-      similarities_bq.append(similarity)
-
     value_of_dot_product_against_attention_unmasked = []
-    attention_scores_unsplit = torch.matmul(query_proj, key_proj.transpose(-2, -1))
-    for i_seq in range(attention_scores_unsplit.shape[1]):
-        for j_seq in range(attention_scores_unsplit.shape[2]):
-            value_of_dot_product_against_attention_unmasked.append(attention_scores_unsplit[0, i_seq, j_seq].detach())
-
-    # Calculate similarities_ppes_bq using the passed ppes argument
     similarities_ppes_bq = []
-    if ppes is not None:
-        for l in range(len(ppes)):
-            kl = torch.matmul(ppes[l], wk_active.T)
-            similarity = cosine_similarity(bq.detach().cpu().numpy().reshape(1, -1), kl.detach().cpu().numpy().reshape(1, -1))[0][0]
-            similarities_ppes_bq.append(similarity)
+    if compute_diagnostics:
+        # Recalculate k1, similarities_bq, etc. with the possibly modified wk_active
+        k1 = F.linear(hidden_states[0][0], wk_active, torch.zeros_like(bk))
+        dot_product_bq_k1 = torch.dot(bq, k1).detach()
+
+        for l in range(len(hidden_states[0])):
+          kl = F.linear(hidden_states[0][l], wk_active, torch.zeros_like(bk))
+          similarity = torch.dot(bq, kl).detach()
+          similarities_bq.append(similarity)
+
+        attention_scores_unsplit = torch.matmul(query_proj, key_proj.transpose(-2, -1))
+        for i_seq in range(attention_scores_unsplit.shape[1]):
+            for j_seq in range(attention_scores_unsplit.shape[2]):
+                value_of_dot_product_against_attention_unmasked.append(attention_scores_unsplit[0, i_seq, j_seq].detach())
+
+        # Calculate similarities_ppes_bq using the passed ppes argument
+        if ppes is not None:
+            for l in range(len(ppes)):
+                kl = torch.matmul(ppes[l], wk_active.T)
+                similarity = cosine_similarity(bq.detach().cpu().numpy().reshape(1, -1), kl.detach().cpu().numpy().reshape(1, -1))[0][0]
+                similarities_ppes_bq.append(similarity)
 
 
     # Reshape Q, K, V for multi-head attention
@@ -252,15 +259,15 @@ def manual_self_attention_new(hidden_states, layer,
     output_bias = attn_layer.c_proj.bias
     attention_output = F.linear(context, output_weight, output_bias)
 
-    # Recalculate similarities_rows_of_wk and bq_Wk with current bq and wk_active
-    all_indexes = list(range(hidden_size))
+    # Recalculate similarities_rows_of_wk with current bq and wk_active (diagnostic-only, see above)
     similarities_rows_of_wk = []
-    for index in all_indexes:
-        one_hot_vector = torch.zeros(hidden_size, dtype=torch.float32, device=hidden_states.device)
-        one_hot_vector[index] = 1.0
-        wk_i = torch.matmul(one_hot_vector, wk_active.T)
-        similarity = torch.abs(torch.dot(bq, wk_i).detach())
-        similarities_rows_of_wk.append(similarity)
+    if compute_diagnostics:
+        for index in range(hidden_size):
+            one_hot_vector = torch.zeros(hidden_size, dtype=torch.float32, device=hidden_states.device)
+            one_hot_vector[index] = 1.0
+            wk_i = torch.matmul(one_hot_vector, wk_active.T)
+            similarity = torch.abs(torch.dot(bq, wk_i).detach())
+            similarities_rows_of_wk.append(similarity)
     bq_Wk = [bq, wk_active] # Return the possibly modified wk_active
 
     return attention_output, attention_weights, query_before_reshape, key_before_reshape, \
@@ -307,7 +314,7 @@ def run_intervention_loop(model, layer_input, ppes,
         normalized = layer.ln_1(layer_input.clone())
 
         attention_output, attention_weights, *_ = manual_self_attention_new(
-            normalized, layer, ppes=ppes, **attn_kwargs
+            normalized, layer, ppes=ppes, compute_diagnostics=False, **attn_kwargs
         )
 
         # Keep all heads: shape [num_heads, seq_len, seq_len] (batch dim squeezed).
