@@ -83,7 +83,7 @@ from datasets_loader import (
 # It internally averages attention to position 0 over layers 4-11 (the paper's
 # "mid" range) — that layer definition lives in intervention_analysis and is
 # inherited unchanged here.
-from intervention_analysis import compute_bos_attention_metric
+from intervention_analysis import compute_bos_attention_metric, compute_band
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
@@ -96,7 +96,7 @@ DEFAULT_SENTENCE = "It was the best of times, it was the worst of times, it was 
 # Model loading (with pre-LayerNorm guard)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_opt(model_name):
+def load_opt(model_name, dtype=torch.float32):
     """Load an OPT model + tokenizer, asserting it matches the pre-LN circuit.
 
     Rejects post-LayerNorm variants (e.g. ``facebook/opt-350m``) and any model
@@ -109,6 +109,7 @@ def load_opt(model_name):
     model = OPTForCausalLM.from_pretrained(model_name, attn_implementation="eager")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model.to(device)
+    model.to(dtype)
     model.eval()
 
     cfg = model.config
@@ -576,8 +577,9 @@ def sentence_analysis(model, tokenizer, sentence, output_dir, num_heads):
 # Mode 2 — Dataset analysis (Table 1: three benchmark datasets, per-dataset + pooled)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, num_heads):
+def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, num_heads, band=None):
     """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}."""
+    ls, le = band if band is not None else (None, None)
     scores_mid = {key: [] for key, *_ in INTERVENTIONS}
     scores_all = {key: [] for key, *_ in INTERVENTIONS}
     n = len(sentences)
@@ -589,7 +591,8 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, num_heads)
         results = run_all_interventions(model, token_embeddings, pos_enc, num_heads)
         for key, *_ in INTERVENTIONS:
             scores_mid[key].append(
-                compute_bos_attention_metric(results[key], num_layers, "mid")
+                compute_bos_attention_metric(results[key], num_layers, "mid",
+                                             layer_start=ls, layer_end=le)
             )
             scores_all[key].append(
                 compute_bos_attention_metric(results[key], num_layers, "all")
@@ -600,7 +603,8 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, num_heads)
 def dataset_analysis(model, tokenizer, output_dir, num_heads,
                      sample_size=DEFAULT_SAMPLE_SIZE,
                      cut_length=DEFAULT_CUT_LENGTH,
-                     seed=DEFAULT_SEED):
+                     seed=DEFAULT_SEED,
+                     band=None):
     """Compute the BOS-attention metric on three standard benchmarks (Table 1).
 
     Datasets: SST-2 (natural language), GSM8K (math), HumanEval (code).  Each is
@@ -628,7 +632,7 @@ def dataset_analysis(model, tokenizer, output_dir, num_heads,
         print(f"\n{'═'*60}")
         print(f"  Dataset: {ds_name}  ({len(sentences)} examples)")
         print(f"{'═'*60}")
-        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, num_heads)
+        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, num_heads, band=band)
         all_mid[ds_name] = s_mid
         all_scope[ds_name] = s_all
 
@@ -719,10 +723,29 @@ def main():
         default=DEFAULT_SEED,
         help="Random seed for dataset sampling.",
     )
+    parser.add_argument(
+        "--layer-mode",
+        choices=["scaled", "fixed"],
+        default="scaled",
+        help="Mid-layer band. 'scaled' (default) excludes the first 3 and last layer "
+             "(= layers 4-11 for a 12-layer model like opt-125m; extends for deeper opt-1.3b/2.7b); "
+             "'fixed' forces layers 4-11 on every size.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Model dtype. Default float32; use a smaller dtype only if VRAM-constrained.",
+    )
     args = parser.parse_args()
 
-    model, tokenizer = load_opt(args.model_name)
+    dtype = {"float32": torch.float32, "float16": torch.float16,
+             "bfloat16": torch.bfloat16}[args.dtype]
+    model, tokenizer = load_opt(args.model_name, dtype=dtype)
     num_heads = model.config.num_attention_heads
+    num_layers = model.config.num_hidden_layers
+    band = compute_band(num_layers, args.layer_mode)
+    print(f"Layers: {num_layers}; mid-band [{band[0]}, {band[1]}) (layer-mode {args.layer_mode}).\n")
 
     if args.mode == "sentence":
         sentence_analysis(model, tokenizer, args.sentence, args.output_dir, num_heads)
@@ -732,6 +755,7 @@ def main():
             sample_size=args.sample_size,
             cut_length=args.cut_length,
             seed=args.seed,
+            band=band,
         )
 
 

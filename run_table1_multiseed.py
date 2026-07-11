@@ -104,8 +104,11 @@ def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
         cmd.extend(["--sample-size", str(args.sample_size)])
     if args.cut_length is not None:
         cmd.extend(["--cut-length", str(args.cut_length)])
-    # --dtype only exists on the Qwen harness; forward it there when requested.
-    if args.architecture == "qwen" and args.dtype is not None:
+    # All four harnesses now accept --layer-mode and --dtype.
+    if args.layer_mode is not None:
+        cmd.extend(["--layer-mode", args.layer_mode])
+    if args.dtype is not None:
+        # 'auto' is only supported by the Qwen harness; other harnesses take an explicit dtype.
         cmd.extend(["--dtype", args.dtype])
 
     print("\n" + "=" * 80)
@@ -315,8 +318,16 @@ def main() -> None:
         "--dtype",
         choices=["float32", "float16", "bfloat16", "auto"],
         default=None,
-        help="Model dtype, forwarded to the Qwen harness only (ignored for gpt2/opt). "
-             "Larger Qwen2.5 checkpoints (7B/14B) typically need float16/bfloat16.",
+        help="Model dtype, forwarded to every harness (default: harness default float32). "
+             "'auto' is Qwen-only. Larger checkpoints typically need float16/bfloat16.",
+    )
+    parser.add_argument(
+        "--layer-mode",
+        choices=["scaled", "fixed"],
+        default=None,
+        help="Mid-layer band, forwarded to every harness (default: harness default 'scaled', "
+             "which excludes the first 3 and last layer and reduces to layers 4-11 for 12-layer "
+             "models). Use 'fixed' to force layers 4-11 on every size.",
     )
     parser.add_argument(
         "--skip-existing",

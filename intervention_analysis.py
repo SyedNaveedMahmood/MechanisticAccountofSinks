@@ -99,8 +99,12 @@ def get_initial_embeddings(model, inputs):
 def manual_self_attention_new(hidden_states, layer,
                               ppes=None,
                               intervene_query_bias=False,
+                              query_bias_scale=1.0,
                               fixed_wk_zero_indices=None,
-                              random_wk_zero_rows=False):
+                              wk_scale_indices=None,
+                              wk_scale=1.0,
+                              random_wk_zero_rows=False,
+                              compute_diagnostics=True):
     """
     Manual implementation of the self-attention mechanism for a single GPT-2 layer.
 
@@ -109,7 +113,14 @@ def manual_self_attention_new(hidden_states, layer,
         layer (torch.nn.Module): The transformer layer module containing the attention sub-layer.
         ppes (torch.Tensor, optional): Positional embeddings (effective positional embeddings) for similarity calculations. Defaults to None.
         intervene_query_bias (bool): If True, nullify the query bias.
+        query_bias_scale (float): Multiplicative scale applied to the query bias bq
+            (used for the dose-response sweep; 1.0 = unchanged, 0.0 = nullified).
+            Ignored when ``intervene_query_bias`` is True (which forces bq = 0).
         fixed_wk_zero_indices (list or None): If a list of indices is provided, zero out these columns in Wk.
+        wk_scale_indices (list or None): If provided, multiply these Wk columns by ``wk_scale``
+            in every layer (graded version of the Zero-Top-3-Wk intervention, used for the
+            coordinate-channel dose-response; wk_scale=1.0 leaves Wk unchanged, 0.0 zeroes them).
+        wk_scale (float): Scale applied to the ``wk_scale_indices`` columns of Wk.
         random_wk_zero_rows (bool): If True, zero out 3 random columns in Wk.
 
     Returns:
@@ -124,7 +135,8 @@ def manual_self_attention_new(hidden_states, layer,
             - value_of_dot_product_against_attention_unmasked (list): Dot product values.
             - similarities_ppes_bq (list): Cosine similarities related to ppes and bq.
             - similarities_rows_of_wk (list): Similarities related to rows of Wk.
-            - bq_Wk (list): bq and wk (modified if interventions applied).
+            - bq_Wk (list): bq and wk (modified if interventions applied). Diagnostic
+              entries are ``None`` when ``compute_diagnostics=False``.
     """
     # Get attention layer parameters
     attn_layer = layer.attn
@@ -142,22 +154,24 @@ def manual_self_attention_new(hidden_states, layer,
     wq, wk, wv = qkv_weight.chunk(3, dim=0)
     bq, bk, bv = qkv_bias.chunk(3, dim=0)
 
-    # --- INTERVENTION A: Nullify query bias ---
+    # --- INTERVENTION A: Nullify query bias (or scale it for dose-response) ---
     if intervene_query_bias:
         bq = torch.zeros_like(bq)
+    elif query_bias_scale != 1.0:
+        bq = query_bias_scale * bq
 
-    # Calculate Wq multiplied by Wk transposed
-    wq_wk_t_product = F.linear(wq, wk.t())
-
-    # Zero out all values except the top 3 in the first token of layer_input
-    first_token_vector = abs(hidden_states[0][0].clone())
-    topk_values, topk_indices_local = torch.topk(first_token_vector, k=3) # Get top 3 absolute values and their indices
-    mask = torch.zeros_like(first_token_vector, dtype=torch.bool)
-    mask[topk_indices_local] = True
-    first_token_vector_masked = torch.zeros_like(first_token_vector)
-    first_token_vector_masked[mask] = first_token_vector[mask]
-    first_token_only_massive = first_token_vector_masked
-    result_vector = torch.matmul(wq_wk_t_product, first_token_only_massive).view(1, num_heads, 1, head_dim)
+    # ``result_vector`` is diagnostic-only.  In particular, avoid the hidden^2
+    # Wq@Wk product in dataset/long-context runs where callers discard it.
+    result_vector = None
+    if compute_diagnostics:
+        wq_wk_t_product = F.linear(wq, wk.t())
+        first_token_vector = hidden_states[0, 0].abs()
+        _, topk_indices_local = torch.topk(first_token_vector, k=3)
+        first_token_only_massive = torch.zeros_like(first_token_vector)
+        first_token_only_massive[topk_indices_local] = first_token_vector[topk_indices_local]
+        result_vector = torch.matmul(
+            wq_wk_t_product, first_token_only_massive
+        ).view(1, num_heads, 1, head_dim)
 
     # --- INTERVENTION E/F: Nullify massive/random activation columns in Wk ---
     wk_active = wk.clone() # Use a temporary variable for modifications
@@ -168,6 +182,9 @@ def manual_self_attention_new(hidden_states, layer,
         # Generate random indices to zero out
         random_indices_to_zero = [random.randint(0, hidden_size - 1) for _ in range(3)]
         wk_active[:, random_indices_to_zero] = 0.0
+    # Graded scaling of specified Wk columns (coordinate-channel dose-response, every layer)
+    if wk_scale_indices is not None and wk_scale != 1.0:
+        wk_active[:, wk_scale_indices] = wk_scale * wk_active[:, wk_scale_indices]
 
 
     # Project input to QKV
@@ -175,34 +192,40 @@ def manual_self_attention_new(hidden_states, layer,
     key_proj = F.linear(hidden_states, wk_active, bk) # Use wk_active
     value_proj = F.linear(hidden_states, wv, bv)
 
-    # Store query and key before reshaping
-    query_before_reshape = query_proj.clone()
-    key_before_reshape = key_proj.clone()
-    value_reshaped = value_proj.clone()
+    # Query/key clones are retained only for the legacy diagnostic API.  Tuple
+    # positions remain stable and contain None in the optimized path.
+    query_before_reshape = query_proj.clone() if compute_diagnostics else None
+    key_before_reshape = key_proj.clone() if compute_diagnostics else None
 
-    # Recalculate k1, similarities_bq, etc. with the possibly modified wk_active
-    k1 = F.linear(hidden_states[0][0], wk_active, torch.zeros_like(bk))
-    dot_product_bq_k1 = torch.dot(bq, k1).detach()
-
+    # Diagnostic-only quantities (used solely by the single-sentence analysis / plotting paths).
+    # These are Python-loop + per-element .detach() computations that force thousands of tiny
+    # GPU->CPU syncs per call (a seq*seq loop plus a hidden-size loop); EVERY dataset / intervention
+    # caller discards them (``attn_out, *_ = ...``), so they are skipped when
+    # compute_diagnostics=False for a ~100x speedup with numerically identical attention output.
     similarities_bq = []
-    for l in range(len(hidden_states[0])):
-      kl = F.linear(hidden_states[0][l], wk_active, torch.zeros_like(bk))
-      similarity = torch.dot(bq, kl).detach()
-      similarities_bq.append(similarity)
-
     value_of_dot_product_against_attention_unmasked = []
-    attention_scores_unsplit = torch.matmul(query_proj, key_proj.transpose(-2, -1))
-    for i_seq in range(attention_scores_unsplit.shape[1]):
-        for j_seq in range(attention_scores_unsplit.shape[2]):
-            value_of_dot_product_against_attention_unmasked.append(attention_scores_unsplit[0, i_seq, j_seq].detach())
-
-    # Calculate similarities_ppes_bq using the passed ppes argument
     similarities_ppes_bq = []
-    if ppes is not None:
-        for l in range(len(ppes)):
-            kl = torch.matmul(ppes[l], wk_active.T)
-            similarity = cosine_similarity(bq.detach().cpu().numpy().reshape(1, -1), kl.detach().cpu().numpy().reshape(1, -1))[0][0]
-            similarities_ppes_bq.append(similarity)
+    if compute_diagnostics:
+        # Recalculate k1, similarities_bq, etc. with the possibly modified wk_active
+        k1 = F.linear(hidden_states[0][0], wk_active, torch.zeros_like(bk))
+        dot_product_bq_k1 = torch.dot(bq, k1).detach()
+
+        for l in range(len(hidden_states[0])):
+          kl = F.linear(hidden_states[0][l], wk_active, torch.zeros_like(bk))
+          similarity = torch.dot(bq, kl).detach()
+          similarities_bq.append(similarity)
+
+        attention_scores_unsplit = torch.matmul(query_proj, key_proj.transpose(-2, -1))
+        for i_seq in range(attention_scores_unsplit.shape[1]):
+            for j_seq in range(attention_scores_unsplit.shape[2]):
+                value_of_dot_product_against_attention_unmasked.append(attention_scores_unsplit[0, i_seq, j_seq].detach())
+
+        # Calculate similarities_ppes_bq using the passed ppes argument
+        if ppes is not None:
+            for l in range(len(ppes)):
+                kl = torch.matmul(ppes[l], wk_active.T)
+                similarity = cosine_similarity(bq.detach().cpu().numpy().reshape(1, -1), kl.detach().cpu().numpy().reshape(1, -1))[0][0]
+                similarities_ppes_bq.append(similarity)
 
 
     # Reshape Q, K, V for multi-head attention
@@ -215,7 +238,7 @@ def manual_self_attention_new(hidden_states, layer,
 
     # Calculate attention scores (Q @ K^T)
     attention_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-    attention_scores_before_mask=attention_scores.clone()
+    attention_scores_before_mask = attention_scores.clone() if compute_diagnostics else None
 
     # Apply causal mask
     sequence_length = hidden_states.size(1)
@@ -237,16 +260,16 @@ def manual_self_attention_new(hidden_states, layer,
     output_bias = attn_layer.c_proj.bias
     attention_output = F.linear(context, output_weight, output_bias)
 
-    # Recalculate similarities_rows_of_wk and bq_Wk with current bq and wk_active
-    all_indexes = list(range(hidden_size))
+    # Recalculate similarities_rows_of_wk with current bq and wk_active (diagnostic-only, see above)
     similarities_rows_of_wk = []
-    for index in all_indexes:
-        one_hot_vector = torch.zeros(hidden_size, dtype=torch.float32, device=hidden_states.device)
-        one_hot_vector[index] = 1.0
-        wk_i = torch.matmul(one_hot_vector, wk_active.T)
-        similarity = torch.abs(torch.dot(bq, wk_i).detach())
-        similarities_rows_of_wk.append(similarity)
-    bq_Wk = [bq, wk_active] # Return the possibly modified wk_active
+    if compute_diagnostics:
+        for index in range(hidden_size):
+            one_hot_vector = torch.zeros(hidden_size, dtype=torch.float32, device=hidden_states.device)
+            one_hot_vector[index] = 1.0
+            wk_i = torch.matmul(one_hot_vector, wk_active.T)
+            similarity = torch.abs(torch.dot(bq, wk_i).detach())
+            similarities_rows_of_wk.append(similarity)
+    bq_Wk = [bq, wk_active] if compute_diagnostics else None
 
     return attention_output, attention_weights, query_before_reshape, key_before_reshape, \
            attention_scores_before_mask, result_vector, similarities_bq, \
@@ -292,7 +315,7 @@ def run_intervention_loop(model, layer_input, ppes,
         normalized = layer.ln_1(layer_input.clone())
 
         attention_output, attention_weights, *_ = manual_self_attention_new(
-            normalized, layer, ppes=ppes, **attn_kwargs
+            normalized, layer, ppes=ppes, compute_diagnostics=False, **attn_kwargs
         )
 
         # Keep all heads: shape [num_heads, seq_len, seq_len] (batch dim squeezed).
@@ -501,8 +524,23 @@ def run_all_interventions(model, token_embeddings, pos_enc):
 LAYER_RANGE_START = 3   # 0-indexed inclusive  (paper layer 4)
 LAYER_RANGE_END = 11    # 0-indexed exclusive  (paper layer 11)
 
-def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope="mid"):
-    """Average attention to BOS from 2nd-half tokens over selected layers, across all heads.
+
+def compute_band(num_layers, layer_mode="scaled"):
+    """0-indexed mid-layer band ``[start, end)`` for the BOS metric, across model scales.
+
+    ``scaled`` (default) excludes the first 3 and the last layer — reducing to exactly
+    ``[3, 11)`` for a 12-layer model (the paper's layers 4–11, so small models are
+    unchanged) and extending proportionally for deeper models. ``fixed`` forces
+    ``[3, 11)`` on every size for strict same-layer comparability.
+    """
+    if layer_mode == "fixed":
+        return (LAYER_RANGE_START, min(LAYER_RANGE_END, num_layers))
+    return (LAYER_RANGE_START, max(LAYER_RANGE_START + 1, num_layers - 1))
+
+
+def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope="mid",
+                                 target_pos=0, layer_start=None, layer_end=None):
+    """Average attention to a target position from 2nd-half tokens over selected layers, across all heads.
 
     Parameters
     ----------
@@ -513,18 +551,26 @@ def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope
     layer_scope : str
         ``"mid"`` — layers 4-11 (1-indexed), i.e. 0-indexed [3, 11).
         ``"all"`` — every layer ``0 .. num_layers-1``.
+    target_pos : int
+        Key position whose received attention is measured. Defaults to 0 (the BOS
+        sink position, matching the paper's metric). Set to 1 for the relocation
+        metric (attention to the Swap-EPE transplant target, position 2 1-indexed).
+    layer_start, layer_end : int or None
+        Explicit 0-indexed band ``[layer_start, layer_end)``. When both are given they
+        override ``layer_scope`` (used by the cross-scale harnesses to pass a depth-aware
+        band from :func:`compute_band`); otherwise the ``layer_scope`` band is used.
 
     Returns
     -------
     float
-        Scalar BOS-attention metric (averaged over heads, tokens, and layers).
+        Scalar attention metric (averaged over heads, tokens, and layers).
     """
-    if layer_scope == "all":
-        layer_start = 0
-        layer_end = num_layers
+    if layer_start is not None and layer_end is not None:
+        ls, le = layer_start, layer_end
+    elif layer_scope == "all":
+        ls, le = 0, num_layers
     elif layer_scope == "mid":
-        layer_start = LAYER_RANGE_START
-        layer_end = min(LAYER_RANGE_END, num_layers)
+        ls, le = LAYER_RANGE_START, min(LAYER_RANGE_END, num_layers)
     else:
         raise ValueError(f"layer_scope must be 'all' or 'mid', got {layer_scope!r}")
 
@@ -532,9 +578,9 @@ def compute_bos_attention_metric(attn_weights_per_layer, num_layers, layer_scope
     second_half_start = seq_len // 2
 
     values = []
-    for layer_idx in range(layer_start, layer_end):
+    for layer_idx in range(ls, le):
         attn = attn_weights_per_layer[layer_idx]  # [num_heads, seq, seq]
-        bos_attn = attn[:, second_half_start:, 0].mean().item()
+        bos_attn = attn[:, second_half_start:, target_pos].mean().item()
         values.append(bos_attn)
 
     return float(np.mean(values))
@@ -664,8 +710,13 @@ def sentence_analysis(model, tokenizer, sentence, output_dir):
 # Mode 2 — Dataset analysis (three benchmark datasets, per-dataset + pooled)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_sentences(model, tokenizer, sentences, ds_label, num_layers):
-    """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}."""
+def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, band=None):
+    """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}.
+
+    ``band`` is an optional ``(layer_start, layer_end)`` mid-layer band (from
+    :func:`compute_band`); when ``None`` the fixed paper band (layers 4–11) is used.
+    """
+    ls, le = band if band is not None else (None, None)
     scores_mid = {key: [] for key, *_ in INTERVENTIONS}
     scores_all = {key: [] for key, *_ in INTERVENTIONS}
     n = len(sentences)
@@ -677,7 +728,8 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers):
         results = run_all_interventions(model, token_embeddings, pos_enc)
         for key, *_ in INTERVENTIONS:
             scores_mid[key].append(
-                compute_bos_attention_metric(results[key], num_layers, "mid")
+                compute_bos_attention_metric(results[key], num_layers, "mid",
+                                             layer_start=ls, layer_end=le)
             )
             scores_all[key].append(
                 compute_bos_attention_metric(results[key], num_layers, "all")
@@ -707,7 +759,8 @@ def _stats_rows(scores, ds_name):
 def dataset_analysis(model, tokenizer, output_dir,
                      sample_size=DEFAULT_SAMPLE_SIZE,
                      cut_length=DEFAULT_CUT_LENGTH,
-                     seed=DEFAULT_SEED):
+                     seed=DEFAULT_SEED,
+                     band=None):
     """Compute BOS-attention metric on three standard benchmarks.
 
     Datasets: SST-2 (natural language), GSM8K (math), HumanEval (code).
@@ -741,7 +794,7 @@ def dataset_analysis(model, tokenizer, output_dir,
         print(f"\n{'═'*60}")
         print(f"  Dataset: {ds_name}  ({len(sentences)} examples)")
         print(f"{'═'*60}")
-        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers)
+        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, band=band)
         all_mid[ds_name] = s_mid
         all_scope[ds_name] = s_all
 
@@ -833,15 +886,36 @@ def main():
         default=DEFAULT_SEED,
         help="Random seed for dataset sampling.",
     )
+    parser.add_argument(
+        "--layer-mode",
+        choices=["scaled", "fixed"],
+        default="scaled",
+        help="Mid-layer band for the BOS metric. 'scaled' (default) excludes the first 3 "
+             "and last layer (= layers 4-11 for a 12-layer model, so GPT-2 small is unchanged; "
+             "extends for deeper models); 'fixed' forces layers 4-11 on every size.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Model dtype. Default float32 (matches the paper's SEs); use a smaller dtype "
+             "only if VRAM-constrained on large models (e.g. gpt2-xl).",
+    )
     args = parser.parse_args()
 
-    print(f"Loading model: {args.model_name}...")
+    dtype = {"float32": torch.float32, "float16": torch.float16,
+             "bfloat16": torch.bfloat16}[args.dtype]
+    print(f"Loading model: {args.model_name} (dtype {args.dtype})...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GPT2LMHeadModel.from_pretrained(args.model_name, attn_implementation="eager")
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
     model.to(device)
+    model.to(dtype)
     model.eval()
-    print(f"Model loaded on {device}.\n")
+    num_layers = len(model.transformer.h)
+    band = compute_band(num_layers, args.layer_mode)
+    print(f"Model loaded on {device}. Layers: {num_layers}; mid-band [{band[0]}, {band[1]}) "
+          f"(layer-mode {args.layer_mode}).\n")
 
     if args.mode == "sentence":
         sentence_analysis(model, tokenizer, args.sentence, args.output_dir)
@@ -851,6 +925,7 @@ def main():
             sample_size=args.sample_size,
             cut_length=args.cut_length,
             seed=args.seed,
+            band=band,
         )
 
 

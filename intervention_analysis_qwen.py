@@ -100,7 +100,7 @@ from datasets_loader import (
 # averages attention to position 0 from the second-half tokens over layers 4-11
 # (the paper's "mid" range); that definition lives in intervention_analysis and
 # is inherited unchanged here.
-from intervention_analysis import compute_bos_attention_metric
+from intervention_analysis import compute_bos_attention_metric, compute_band
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
@@ -698,8 +698,9 @@ def sentence_analysis(model, tokenizer, sentence, output_dir, geom):
 # Mode 2 — Dataset analysis (Table 1: three benchmark datasets, per-dataset + pooled)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, geom):
+def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, geom, band=None):
     """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}."""
+    ls, le = band if band is not None else (None, None)
     scores_mid = {key: [] for key, *_ in INTERVENTIONS}
     scores_all = {key: [] for key, *_ in INTERVENTIONS}
     n = len(sentences)
@@ -711,7 +712,8 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, geom):
         results = run_all_interventions(model, token_embeddings, geom)
         for key, *_ in INTERVENTIONS:
             scores_mid[key].append(
-                compute_bos_attention_metric(results[key], num_layers, "mid")
+                compute_bos_attention_metric(results[key], num_layers, "mid",
+                                             layer_start=ls, layer_end=le)
             )
             scores_all[key].append(
                 compute_bos_attention_metric(results[key], num_layers, "all")
@@ -722,7 +724,8 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, geom):
 def dataset_analysis(model, tokenizer, output_dir, geom,
                      sample_size=DEFAULT_SAMPLE_SIZE,
                      cut_length=DEFAULT_CUT_LENGTH,
-                     seed=DEFAULT_SEED):
+                     seed=DEFAULT_SEED,
+                     band=None):
     """Compute the BOS-attention metric on three standard benchmarks (Table 1).
 
     Datasets: SST-2 (natural language), GSM8K (math), HumanEval (code).  Each is
@@ -750,7 +753,7 @@ def dataset_analysis(model, tokenizer, output_dir, geom,
         print(f"\n{'═'*60}")
         print(f"  Dataset: {ds_name}  ({len(sentences)} examples)")
         print(f"{'═'*60}")
-        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, geom)
+        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, geom, band=band)
         all_mid[ds_name] = s_mid
         all_scope[ds_name] = s_all
 
@@ -850,10 +853,21 @@ def main():
         default=DEFAULT_SEED,
         help="Random seed for dataset sampling.",
     )
+    parser.add_argument(
+        "--layer-mode",
+        choices=["scaled", "fixed"],
+        default="scaled",
+        help="Mid-layer band. 'scaled' (default) excludes the first 3 and last layer "
+             "(= layers 4-11 for a 12-layer model; extends for the deeper Qwen2.5 checkpoints, "
+             "all ≥24 layers); 'fixed' forces layers 4-11 on every size.",
+    )
     args = parser.parse_args()
 
     model, tokenizer = load_qwen(args.model_name, dtype=args.dtype)
     geom = _model_geometry(model)
+    num_layers = len(model.model.layers)
+    band = compute_band(num_layers, args.layer_mode)
+    print(f"Layers: {num_layers}; mid-band [{band[0]}, {band[1]}) (layer-mode {args.layer_mode}).\n")
 
     if args.mode == "sentence":
         sentence_analysis(model, tokenizer, args.sentence, args.output_dir, geom)
@@ -863,6 +877,7 @@ def main():
             sample_size=args.sample_size,
             cut_length=args.cut_length,
             seed=args.seed,
+            band=band,
         )
 
 
