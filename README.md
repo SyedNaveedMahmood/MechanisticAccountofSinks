@@ -275,13 +275,16 @@ python residual_sink_analysis.py --mode dose_response --sample-size 20 --seeds 0
 
 Modes (each maps to a paper-ready deliverable):
 
-- **`dose_response` (E4.1)** — BOS-attention vs. scale `α ∈ {0,…,1.5}` on three knobs:
-  `b_Q` (pathway A), `p_1` (the position-0 PE that is the EPE_1 source, feeding **both**
-  pathways), and the top-3 `W_k` massive columns (coordinate channel, graded every layer).
-  The differing `α=0` **floors** (≈44% for `b_Q`; near the Remove-First-PE floor for `p_1`)
-  are the two-pathway signature. Each knob acts at an **effective locus** — the input (`p_1`)
-  or every layer (`W_k`) — because a layer-0-only edit is erased by the intermediate layers
-  before the metric window (paper fn. 10). → `aggregate/dose_response.png`, `dose_response_monotonicity.csv`.
+- **`dose_response` (E4.1)** — BOS-attention vs. scale `α ∈ {0,…,1.5}` on four knobs:
+  `scale_bq` (`b_Q`, pathway A — floors at the residual, ≈44% on gpt2); `scale_pe`
+  (*delete* `p_1` — empirically the sink **survives** deletion, ≈85–110% at `α=0`: a
+  deletion-invariance finding); `interp_pe` (*replace* positional identity,
+  `pe[0] = α·p_1 + (1−α)·p_2` — grades Remove-First-PE, both pathways collapse to the
+  ≈3% floor at `α=0`); and `scale_wk_massive` (the top-k massive `W_k` columns, graded in
+  every layer; k = number of identified massive coords, recorded in `run_config.json`).
+  Each knob acts at an **effective locus** — the input (`p_1`) or every layer (`W_k`) —
+  because a layer-0-only edit is erased by the intermediate layers before the metric
+  window (paper fn. 10). → `aggregate/dose_response.png`, `dose_response_monotonicity.csv`.
 - **`decomposition` (E4.2)** — exact T1-vs-T3 attribution of the position-1 advantage
   (with an identity assert `T1+T2+T3+T4 == score`), plus the query–EPE_1 alignment
   histogram (the Fig. 2 analog for downstream queries).

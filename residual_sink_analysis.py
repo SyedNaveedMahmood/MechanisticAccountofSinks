@@ -20,14 +20,16 @@ is driven by T1 (content) + T3 (source-agnostic shift) only.
 
 Modes
 -----
-  dose_response   E4.1  BOS-attention vs scale α on three knobs: b_Q (pathway A); p_1, the
-                        position-0 PE that is the EPE_1 source (both pathways); and the top-3
-                        W_k massive columns (coordinate channel, graded every layer). The
-                        differing α=0 floors are the two-pathway signature. NOTE: the knobs act
-                        at the input (p_1) or in every layer (W_k), NOT on the layer-0 MLP output
-                        only — a layer-0-only edit is inert because the massive activations at
-                        position 0 are re-established by the intermediate layers (paper fn. 10)
-                        before the metric window (layers 4-11).
+  dose_response   E4.1  BOS-attention vs scale α on four knobs: b_Q (pathway A); p_1 deletion
+                        (scale_pe — empirically the sink SURVIVES deletion, ~85-110% at α=0);
+                        p_1 → p_2 interpolation (interp_pe — positional-identity replacement,
+                        grades Remove-First-PE, both pathways collapse to ~3% at α=0); and the
+                        top-k massive W_k columns (coordinate channel, graded every layer;
+                        k = len(massive_coords), recorded per run). The differing α=0 floors are
+                        the pathway signature. NOTE: the knobs act at the input (p_1) or in every
+                        layer (W_k), NOT on the layer-0 MLP output only — a layer-0-only edit is
+                        inert because the massive activations at position 0 are re-established by
+                        the intermediate layers (paper fn. 10) before the metric window.
   decomposition   E4.2  Exact T1/T3 attribution of the position-1 advantage + the
                         query–EPE_1 alignment histogram (Fig. 2 analog for downstream queries).
   combined        E4.3  Stacked interventions (b∧c, b∧i, b∧d, b∧i∧d) localizing the residual.
@@ -200,14 +202,31 @@ def _pe_zero_first(pe):
 
 
 def _pe_scale_first(alpha):
-    """Input-level EPE_1 source knob: scale the position-0 PE (p_1) by alpha.
+    """Input-level p_1 *deletion* knob: scale the position-0 PE (p_1) by alpha.
 
-    alpha=1 is baseline; alpha=0 removes the positional signal at position 0 (≈ the
-    Remove-First-PE / No-PE-at-position-0 floor), collapsing *both* pathways since both
-    depend on EPE_1 = MLP(p_1) + p_1.
+    alpha=1 is baseline; alpha=0 zeroes the positional signal at position 0.
+    Empirically (GPT-2 small/medium) this does NOT collapse the sink — deleting p_1
+    leaves position 0 positionally *distinct* and the sink survives (~85-110% of
+    baseline). Kept as the deletion-invariance finding; the graded both-pathways
+    collapse is measured by :func:`_pe_interp_first` instead.
     """
     def _t(pe):
         pe[0][0] = alpha * pe[0][0]
+        return pe
+    return _t
+
+
+def _pe_interp_first(alpha):
+    """Positional-identity *interpolation* knob: pe[0] = alpha·p_1 + (1−alpha)·p_2.
+
+    Grades the paper's Remove-First-PE intervention: alpha=1 is baseline (position 0
+    keeps p_1); alpha=0 gives position 0 exactly p_2 (== intervention (c), ~3% floor,
+    both pathways collapse since EPE_1 never forms and position 0 is relabelled as
+    position 2). Unlike :func:`_pe_scale_first`, this replaces positional identity
+    rather than deleting it, which is what actually kills the sink.
+    """
+    def _t(pe):
+        pe[0][0] = alpha * pe[0][0] + (1.0 - alpha) * pe[0][1]
         return pe
     return _t
 
@@ -398,11 +417,14 @@ def run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=No
     Knobs are driven at an *effective* locus (see the module header on why layer-0-only
     edits wash out):
       scale_bq         : scale the query bias b_Q             — pathway A; floors at the residual
-      scale_pe         : scale the position-0 PE p_1 (input)  — EPE_1 source, both pathways; floors low
-      scale_wk_massive : scale the top-3 W_k columns (every layer) — coordinate channel; grades Zero-Top-3-Wk
+      scale_pe         : scale (delete) the position-0 PE p_1 — deletion-invariance control; sink survives
+      interp_pe        : interpolate p_1 → p_2 at position 0  — positional-identity replacement; grades
+                         Remove-First-PE, both pathways collapse (~3% floor at alpha=0)
+      scale_wk_massive : scale the top-k massive W_k columns (every layer) — coordinate channel;
+                         grades Zero-Top-k-Wk (k = len(massive_coords), recorded in run_config.json)
     """
     num_layers = len(model.transformer.h)
-    knobs = ["scale_bq", "scale_pe", "scale_wk_massive"]
+    knobs = ["scale_bq", "scale_pe", "interp_pe", "scale_wk_massive"]
     acc = {(k, a): [] for k in knobs for a in alphas}
 
     for _ds, _ids, te, pe in tqdm(
@@ -415,6 +437,8 @@ def run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=No
                 bos_metric(run_config(model, te, pe, scale_bq=a), num_layers, band=band))
             acc[("scale_pe", a)].append(
                 bos_metric(run_config(model, te, pe, pe_transform=_pe_scale_first(a)), num_layers, band=band))
+            acc[("interp_pe", a)].append(
+                bos_metric(run_config(model, te, pe, pe_transform=_pe_interp_first(a)), num_layers, band=band))
             acc[("scale_wk_massive", a)].append(
                 bos_metric(run_config(model, te, pe,
                                       wk_scale_coords=massive_coords, wk_scale=a), num_layers, band=band))
@@ -457,7 +481,13 @@ def run_decomposition(model, tokenizer, sampled, assert_identity=False, band=Non
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _combined_and_surgical_specs(model, massive_coords):
-    """Return {name: builder(te, pe) -> attn_weights}. Builders close over the model."""
+    """Return {name: builder(te, pe) -> attn_weights}. Builders close over the model.
+
+    The ``zero_topk_wk`` interventions zero ALL identified massive-activation columns
+    of W_k, so k = len(massive_coords) — 3 for GPT-2 small (coords 138/378/447, matching
+    the paper's Zero-Top-3-Wk), but model-dependent in general (e.g. 6 for gpt2-medium).
+    The per-run k and coordinate list are recorded in run_config.json.
+    """
     def epe_hats(pe):
         ppes = compute_ppes(model, pe)
         return (ppes[0] / torch.linalg.norm(ppes[0]), ppes[1] / torch.linalg.norm(ppes[1]))
@@ -469,11 +499,11 @@ def _combined_and_surgical_specs(model, massive_coords):
     # E4.3 combined
     specs["bq0__remove_first_pe"] = lambda te, pe: run_config(
         model, te, pe, nullify_bq=True, pe_transform=_pe_remove_first)
-    specs["bq0__zero_top3_wk"] = lambda te, pe: run_config(
+    specs["bq0__zero_topk_wk"] = lambda te, pe: run_config(
         model, te, pe, nullify_bq=True, wk_zero_coords=massive_coords)
     specs["bq0__swap_epe"] = lambda te, pe: run_config(
         model, te, pe, nullify_bq=True, mlp_modify=make_swap_direction(*epe_hats(pe)))
-    specs["bq0__zero_top3_wk__swap_epe"] = lambda te, pe: run_config(
+    specs["bq0__zero_topk_wk__swap_epe"] = lambda te, pe: run_config(
         model, te, pe, nullify_bq=True, wk_zero_coords=massive_coords,
         mlp_modify=make_swap_direction(*epe_hats(pe)))
     # E4.4 surgical vs. coarse
@@ -542,11 +572,15 @@ def run_relocation(model, tokenizer, sampled, band=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_perplexity(model, tokenizer, sampled, massive_coords):
-    """LM cross-entropy under each pathway ablation (and an HF baseline sanity check)."""
+    """LM cross-entropy under each pathway ablation (and an HF baseline sanity check).
+
+    ``zero_topk_wk`` zeroes all k = len(massive_coords) massive W_k columns (k and the
+    coordinate list are recorded in run_config.json).
+    """
     configs = {
         "baseline": dict(),
         "nullify_bq": dict(attn_kwargs={"intervene_query_bias": True}),
-        "zero_top3_wk": dict(attn_kwargs={"fixed_wk_zero_indices": list(massive_coords)}),
+        "zero_topk_wk": dict(attn_kwargs={"fixed_wk_zero_indices": list(massive_coords)}),
         "first_layer_mlp_skip": dict(mlp_modify=make_zero_layer0_mlp()),
     }
     acc = {n: [] for n in configs}
@@ -574,14 +608,16 @@ def run_perplexity(model, tokenizer, sampled, massive_coords):
 
 KNOB_LABELS = {
     "scale_bq": r"Scale $b_Q$ (pathway A: bias)",
-    "scale_pe": r"Scale $p_1$ (EPE$_1$ source: both pathways)",
-    "scale_wk_massive": r"Scale top-3 $W_k$ columns (coordinate channel)",
+    "scale_pe": r"Scale $p_1$ (deletion — sink survives)",
+    "interp_pe": r"Interpolate $p_1 \to p_2$ (identity replacement: both pathways)",
+    "scale_wk_massive": r"Scale top-$k$ massive $W_k$ columns (coordinate channel)",
 }
 
 
 def plot_dose_response(df_mean, df_std, save_path, baseline=None):
     fig, ax = plt.subplots(figsize=(7.5, 5))
-    for knob in ["scale_bq", "scale_pe", "scale_wk_massive"]:
+    present = set(df_mean["knob"].unique())
+    for knob in [k for k in KNOB_LABELS if k in present]:
         m = df_mean[df_mean["knob"] == knob].sort_values("alpha")
         y = m["bos_attention"].values
         x = m["alpha"].values
@@ -658,8 +694,8 @@ def run_all_modes(model, tokenizer, sampled, modes, alphas, massive_coords, with
         specs = _combined_and_surgical_specs(model, massive_coords)
         if "combined" in modes:
             print("Running mode: combined")
-            names = ["baseline", "nullify_bq", "bq0__remove_first_pe", "bq0__zero_top3_wk",
-                     "bq0__swap_epe", "bq0__zero_top3_wk__swap_epe"]
+            names = ["baseline", "nullify_bq", "bq0__remove_first_pe", "bq0__zero_topk_wk",
+                     "bq0__swap_epe", "bq0__zero_topk_wk__swap_epe"]
             res["combined"] = run_intervention_set(model, tokenizer, sampled, names, specs, band=band)
         if "surgical" in modes:
             print("Running mode: surgical")
