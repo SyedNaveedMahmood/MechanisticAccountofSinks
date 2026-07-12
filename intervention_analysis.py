@@ -49,6 +49,7 @@ import pandas as pd
 import math
 import argparse
 import random
+import json
 from pathlib import Path
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -93,6 +94,70 @@ def get_initial_embeddings(model, inputs):
     return captured["pos_enc"], captured["token_embeddings"]
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Massive-activation coordinate identification (intervention (i))
+#
+# The paper's "Zero Top-3 Wk" intervention removes the *massive activations* of the
+# effective positional embedding EPE_0 — coordinates whose magnitude is a statistical
+# outlier (|value| > mean + n_std·std of |EPE_0|). For GPT-2 small there are exactly
+# three such coordinates (138, 378, 447), so "top-3" and "the massive activations"
+# coincide. Larger / different models generally have a *different number* of massive
+# coordinates at *different indices*, so a blind fixed top-3 (a) targets the wrong
+# columns and (b) under- or over-ablates. We therefore identify the massive set with
+# the paper's own outlier criterion — identical to the E4 residual-sink analysis
+# (`residual_sink_analysis.identify_massive_coords`) and the E3 emergence analysis —
+# and zero exactly those columns. This reduces to {138,378,447} on GPT-2 small (so the
+# reproduction is byte-for-byte unchanged) and generalises faithfully across scales.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MASSIVE_N_STD = 3.0        # outlier threshold: |EPE_0[d]| > mean + MASSIVE_N_STD·std
+MASSIVE_MIN_COORDS = 3     # fall back to the top-k |EPE_0| dims if fewer exceed it
+
+
+def select_massive_coords(signal, n_std=MASSIVE_N_STD, min_coords=MASSIVE_MIN_COORDS):
+    """Indices of the *massive activations* of a 1-D signal vector.
+
+    A coordinate is "massive" when ``|signal[d]| > mean + n_std·std`` of ``|signal|``
+    (the paper's / E4's definition). If fewer than ``min_coords`` coordinates exceed
+    the threshold, fall back to the ``min_coords`` largest-magnitude dimensions so the
+    set is never smaller than the paper's top-3. Returned in descending-magnitude order
+    for stable, interpretable provenance.
+
+    On GPT-2 small's EPE_0 this returns exactly [138, 378, 447].
+    """
+    a = np.abs(signal.detach().float().cpu().numpy())
+    coords = np.where(a > a.mean() + n_std * a.std())[0]
+    if coords.size < min_coords:
+        coords = np.argsort(a)[-min_coords:]
+    # order the selected coordinates by descending magnitude
+    coords = coords[np.argsort(a[coords])[::-1]]
+    return [int(i) for i in coords]
+
+
+def compute_epe0(model):
+    """Effective positional embedding of position 0 = p_0 + MLP^(0)(p_0).
+
+    Computed via the same forward-hook path the interventions use, on a short dummy
+    input. EPE_0 is input-independent (position 0's PE is fixed and the layer-0 MLP is
+    position-wise), so the returned vector — and hence the massive-coordinate set — is a
+    deterministic property of the model.
+    """
+    device = next(model.parameters()).device
+    dummy = {"input_ids": torch.arange(8, device=device).unsqueeze(0)}
+    pos_enc, _ = get_initial_embeddings(model, dummy)
+    with torch.no_grad():
+        ppes = pos_enc[0] + model.transformer.h[0].mlp(pos_enc)[0]
+    return ppes[0]
+
+
+def identify_massive_coords(model, tokenizer=None, n_std=MASSIVE_N_STD, min_coords=MASSIVE_MIN_COORDS):
+    """Massive-activation coordinates of this model's EPE_0 (deterministic per model).
+
+    ``tokenizer`` is accepted for call-site symmetry with the other harnesses but unused
+    (EPE_0 is computed from the model's own positional embeddings).
+    """
+    return select_massive_coords(compute_epe0(model), n_std, min_coords)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Manual self-attention  (UNCHANGED from reconstruct_whole_model.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -104,6 +169,7 @@ def manual_self_attention_new(hidden_states, layer,
                               wk_scale_indices=None,
                               wk_scale=1.0,
                               random_wk_zero_rows=False,
+                              random_wk_zero_count=3,
                               compute_diagnostics=True):
     """
     Manual implementation of the self-attention mechanism for a single GPT-2 layer.
@@ -121,7 +187,11 @@ def manual_self_attention_new(hidden_states, layer,
             in every layer (graded version of the Zero-Top-3-Wk intervention, used for the
             coordinate-channel dose-response; wk_scale=1.0 leaves Wk unchanged, 0.0 zeroes them).
         wk_scale (float): Scale applied to the ``wk_scale_indices`` columns of Wk.
-        random_wk_zero_rows (bool): If True, zero out 3 random columns in Wk.
+        random_wk_zero_rows (bool): If True, zero out ``random_wk_zero_count`` random
+            columns in Wk (control for intervention (i)).
+        random_wk_zero_count (int): Number of random Wk columns to zero when
+            ``random_wk_zero_rows`` is True. Defaults to 3 (matching the paper's top-3);
+            set to the per-model massive-coordinate count so (j) matches (i) in size.
 
     Returns:
         tuple: A tuple containing:
@@ -179,8 +249,10 @@ def manual_self_attention_new(hidden_states, layer,
         # User specified indices to zero out
         wk_active[:, fixed_wk_zero_indices] = 0.0
     elif random_wk_zero_rows:
-        # Generate random indices to zero out
-        random_indices_to_zero = [random.randint(0, hidden_size - 1) for _ in range(3)]
+        # Generate random indices to zero out. The count matches the number of massive
+        # coordinates zeroed by intervention (i) so (j) is a size-matched control.
+        random_indices_to_zero = [random.randint(0, hidden_size - 1)
+                                  for _ in range(random_wk_zero_count)]
         wk_active[:, random_indices_to_zero] = 0.0
     # Graded scaling of specified Wk columns (coordinate-channel dose-response, every layer)
     if wk_scale_indices is not None and wk_scale != 1.0:
@@ -451,45 +523,55 @@ def intervention_h_no_pe(model, token_embeddings, pos_enc):
     return run_intervention_loop(model, layer_input, ppes=None)
 
 
-def intervention_i_zero_top_wk(model, token_embeddings, pos_enc):
-    """(i) Zero Top-3 Wk: in every layer, zero out the 3 columns of Wk whose
-    indices correspond to the top-3 absolute-value dimensions of EPE[0] (ppes[0]).
+def intervention_i_zero_top_wk(model, token_embeddings, pos_enc, zero_indices=None):
+    """(i) Zero Top-3 Wk: in every layer, zero out the columns of Wk that correspond to
+    the *massive activations* of EPE[0] (ppes[0]) — coordinates whose |value| exceeds
+    ``mean + 3·std`` of |EPE[0]| (paper: the 3 coords 138/378/447 on GPT-2 small, hence
+    "Top-3"; larger models generally have a different count), see
+    :func:`select_massive_coords`.
 
     The intuition is that these large-activation coordinates of the effective
-    positional embedding dominate the key projection; removing them tests how
-    much the BOS-attention sink depends on those specific dimensions.
+    positional embedding dominate the key projection; removing them tests how much the
+    BOS-attention sink depends on those specific dimensions.
 
-    The same column indices are zeroed in Wk for every layer.
+    ``zero_indices`` (the pre-identified massive coordinates for this model) is supplied
+    by the caller so the exact columns are recorded once and reused for every sentence.
+    When ``None`` the coordinates are re-derived from EPE[0] here (identical result,
+    since EPE[0] is input-independent). The same columns are zeroed in Wk for every layer.
     """
     pos_enc_copy = pos_enc.clone()
     layer_input = token_embeddings.clone() + pos_enc_copy
     ppes = pos_enc_copy[0] + model.transformer.h[0].mlp(pos_enc_copy)[0]
 
-    # Find top-3 dimensions of |EPE[0]| and fix them for every layer.
-    _, topk_indices = torch.topk(ppes[0].abs(), k=3)
-    fixed_wk_zero_indices = topk_indices.tolist()
+    if zero_indices is None:
+        zero_indices = select_massive_coords(ppes[0])
 
     return run_intervention_loop(
         model, layer_input, ppes,
-        attn_kwargs={"fixed_wk_zero_indices": fixed_wk_zero_indices},
+        attn_kwargs={"fixed_wk_zero_indices": list(zero_indices)},
     )
 
 
-def intervention_j_zero_random_wk(model, token_embeddings, pos_enc):
-    """(j) Zero Random Wk: in every layer, zero out 3 randomly chosen columns of Wk.
+def intervention_j_zero_random_wk(model, token_embeddings, pos_enc, k=None):
+    """(j) Zero Random Wk: in every layer, zero out ``k`` randomly chosen columns of Wk.
 
-    Acts as a control for intervention (i): if (i) shows a large effect, this
-    confirms that the result is specific to the top-EPE dimensions rather than
-    any random ablation of Wk columns.
+    Acts as a size-matched control for intervention (i): ``k`` is the number of massive
+    coordinates (i) zeroes, so a large (i) effect that (j) does not reproduce confirms
+    the result is specific to the massive-EPE dimensions rather than any random ablation
+    of the same number of Wk columns. When ``k`` is None it defaults to the model's
+    massive-coordinate count.
     """
-    random.seed(DEFAULT_SEED)
     pos_enc_copy = pos_enc.clone()
     layer_input = token_embeddings.clone() + pos_enc_copy
     ppes = pos_enc_copy[0] + model.transformer.h[0].mlp(pos_enc_copy)[0]
 
+    if k is None:
+        k = len(select_massive_coords(ppes[0]))
+    random.seed(DEFAULT_SEED)
+
     return run_intervention_loop(
         model, layer_input, ppes,
-        attn_kwargs={"random_wk_zero_rows": True},
+        attn_kwargs={"random_wk_zero_rows": True, "random_wk_zero_count": k},
     )
 
 
@@ -511,13 +593,22 @@ INTERVENTIONS = [
 # Shared helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_all_interventions(model, token_embeddings, pos_enc):
-    """Run every registered intervention and return {key: [layer_weights]}."""
+def run_all_interventions(model, token_embeddings, pos_enc, massive_coords=None):
+    """Run every registered intervention and return {key: [layer_weights]}.
+
+    ``massive_coords`` (identified once per model) is threaded to the Wk interventions:
+    (i) zeroes exactly those columns and (j) zeroes an equal number of random columns.
+    When None, each falls back to re-deriving the set from EPE[0].
+    """
+    extra = {}
+    if massive_coords is not None:
+        extra["int_i"] = {"zero_indices": list(massive_coords)}
+        extra["int_j"] = {"k": len(massive_coords)}
     results = {}
     for key, _label, desc, fn in INTERVENTIONS:
         print(f"  Running {key} ({desc})...")
         with torch.no_grad():
-            results[key] = fn(model, token_embeddings, pos_enc)
+            results[key] = fn(model, token_embeddings, pos_enc, **extra.get(key, {}))
     return results
 
 
@@ -673,7 +764,10 @@ def sentence_analysis(model, tokenizer, sentence, output_dir):
     print(f"Sentence: {sentence!r}")
     print(f"Tokens ({len(tokens)}): {tokens}")
 
-    all_results = run_all_interventions(model, token_embeddings, pos_enc)
+    massive_coords = identify_massive_coords(model, tokenizer)
+    print(f"Massive-activation coordinates of EPE_0 ({len(massive_coords)}): {massive_coords}")
+    all_results = run_all_interventions(model, token_embeddings, pos_enc,
+                                        massive_coords=massive_coords)
 
     num_layers = len(model.transformer.h)
     num_heads = model.config.n_head
@@ -710,11 +804,14 @@ def sentence_analysis(model, tokenizer, sentence, output_dir):
 # Mode 2 — Dataset analysis (three benchmark datasets, per-dataset + pooled)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, band=None):
+def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, band=None,
+                   massive_coords=None):
     """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}.
 
     ``band`` is an optional ``(layer_start, layer_end)`` mid-layer band (from
     :func:`compute_band`); when ``None`` the fixed paper band (layers 4–11) is used.
+    ``massive_coords`` is the pre-identified massive-EPE coordinate set for the Wk
+    interventions (i)/(j).
     """
     ls, le = band if band is not None else (None, None)
     scores_mid = {key: [] for key, *_ in INTERVENTIONS}
@@ -725,7 +822,8 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, band=None)
         inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
         inputs = inputs.to(model.device)
         pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
-        results = run_all_interventions(model, token_embeddings, pos_enc)
+        results = run_all_interventions(model, token_embeddings, pos_enc,
+                                        massive_coords=massive_coords)
         for key, *_ in INTERVENTIONS:
             scores_mid[key].append(
                 compute_bos_attention_metric(results[key], num_layers, "mid",
@@ -756,11 +854,54 @@ def _stats_rows(scores, ds_name):
     return rows
 
 
+def build_run_config(model, massive_coords, *, model_name, dtype, layer_mode, band,
+                     seed, sample_size, cut_length, harness="intervention_analysis.py",
+                     massive_signal="EPE_0 = p_0 + MLP^(0)(p_0)"):
+    """Provenance record for a Table-1 intervention run (written to run_config.json).
+
+    Records the concrete model geometry and the exact massive-activation coordinates
+    zeroed by intervention (i) / counted by (j). This makes every run self-describing:
+    a duplicated or mislabeled output is immediately detectable (the geometry and coords
+    would not match the model), and the "Zero Top-3 Wk" identification is fully auditable.
+    """
+    cfg = model.config
+    return {
+        "experiment": "E1/E2 Table 1 cross-scale intervention sweep",
+        "harness": harness,
+        "model_name": model_name,
+        "model_type": getattr(cfg, "model_type", None),
+        "num_layers": int(getattr(cfg, "n_layer", None) or getattr(cfg, "num_hidden_layers", 0)),
+        "num_heads": int(getattr(cfg, "n_head", None) or getattr(cfg, "num_attention_heads", 0)),
+        "hidden_size": int(getattr(cfg, "n_embd", None) or getattr(cfg, "hidden_size", 0)),
+        "dtype": dtype,
+        "layer_mode": layer_mode,
+        "band_start": None if band is None else int(band[0]),
+        "band_end": None if band is None else int(band[1]),
+        "massive_coord_signal": massive_signal,
+        "massive_coord_rule": f"|signal| > mean + {MASSIVE_N_STD}*std, else top-{MASSIVE_MIN_COORDS}",
+        "massive_n_std": MASSIVE_N_STD,
+        "massive_min_coords": MASSIVE_MIN_COORDS,
+        "massive_coords": None if massive_coords is None else [int(c) for c in massive_coords],
+        "num_massive_coords": None if massive_coords is None else len(massive_coords),
+        "random_wk_control": {
+            "seed": DEFAULT_SEED,
+            "count": None if massive_coords is None else len(massive_coords),
+            "resampled_per_layer": True,
+        },
+        "sample_size": sample_size,
+        "cut_length": cut_length,
+        "seed": seed,
+    }
+
+
 def dataset_analysis(model, tokenizer, output_dir,
                      sample_size=DEFAULT_SAMPLE_SIZE,
                      cut_length=DEFAULT_CUT_LENGTH,
                      seed=DEFAULT_SEED,
-                     band=None):
+                     band=None,
+                     model_name="gpt2",
+                     dtype="float32",
+                     layer_mode="scaled"):
     """Compute BOS-attention metric on three standard benchmarks.
 
     Datasets: SST-2 (natural language), GSM8K (math), HumanEval (code).
@@ -769,6 +910,7 @@ def dataset_analysis(model, tokenizer, output_dir,
     *cut_length* tokens before processing.
 
     Outputs under ``<output_dir>/dataset_analysis/``:
+      run_config.json                     — provenance (model geometry, massive coords)
       sample_manifest.csv                 — exact examples evaluated
       bos_attention_stats_by_dataset.csv  — per-dataset detailed stats
       bos_attention_stats_overall.csv     — pooled across all 3 datasets
@@ -779,6 +921,16 @@ def dataset_analysis(model, tokenizer, output_dir,
     output_path.mkdir(parents=True, exist_ok=True)
 
     num_layers = len(model.transformer.h)
+
+    # Identify this model's massive-EPE_0 coordinates once (deterministic per model);
+    # intervention (i) zeroes exactly these columns and (j) an equal number of random ones.
+    massive_coords = identify_massive_coords(model, tokenizer)
+    print(f"Massive-activation coordinates of EPE_0 ({len(massive_coords)}): {massive_coords}")
+    run_cfg = build_run_config(
+        model, massive_coords, model_name=model_name, dtype=dtype,
+        layer_mode=layer_mode, band=band, seed=seed,
+        sample_size=sample_size, cut_length=cut_length)
+    (output_path / "run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
 
     sampled, manifest_rows = sample_benchmark_datasets(
         tokenizer, sample_size=sample_size,
@@ -794,7 +946,8 @@ def dataset_analysis(model, tokenizer, output_dir,
         print(f"\n{'═'*60}")
         print(f"  Dataset: {ds_name}  ({len(sentences)} examples)")
         print(f"{'═'*60}")
-        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, band=band)
+        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers,
+                                      band=band, massive_coords=massive_coords)
         all_mid[ds_name] = s_mid
         all_scope[ds_name] = s_all
 
@@ -926,6 +1079,9 @@ def main():
             cut_length=args.cut_length,
             seed=args.seed,
             band=band,
+            model_name=args.model_name,
+            dtype=args.dtype,
+            layer_mode=args.layer_mode,
         )
 
 

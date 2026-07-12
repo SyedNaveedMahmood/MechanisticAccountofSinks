@@ -79,6 +79,7 @@ Interventions (labelled a-j) — same 10 keys/labels as the GPT-2 version
 
 import argparse
 import random
+import json
 from pathlib import Path
 
 import matplotlib
@@ -99,8 +100,13 @@ from datasets_loader import (
 # Architecture-agnostic metric (pure attention-tensor math): reuse as-is.  It
 # averages attention to position 0 from the second-half tokens over layers 4-11
 # (the paper's "mid" range); that definition lives in intervention_analysis and
-# is inherited unchanged here.
-from intervention_analysis import compute_bos_attention_metric, compute_band
+# is inherited unchanged here. The massive-activation selector and run_config.json
+# provenance builder are shared too, so the "massive" rule (|signal| > mean + 3*std,
+# top-3 fallback) is identical across all harnesses.
+from intervention_analysis import (
+    compute_bos_attention_metric, compute_band,
+    select_massive_coords, build_run_config,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
@@ -259,7 +265,8 @@ def manual_self_attention_qwen(hidden_states, layer, num_heads, num_kv_heads, he
                                cos, sin,
                                intervene_query_bias=False,
                                fixed_wk_zero_indices=None,
-                               random_wk_zero_rows=False):
+                               random_wk_zero_rows=False,
+                               random_wk_zero_count=3):
     """Manual Qwen2 self-attention for a single (already RMSNorm'd) layer input.
 
     Mirrors ``manual_self_attention_new`` from the GPT-2 harness but uses Qwen2's
@@ -277,7 +284,8 @@ def manual_self_attention_qwen(hidden_states, layer, num_heads, num_kv_heads, he
         cos, sin:      RoPE tables ``[seq, head_dim]`` for this run's position ids.
         intervene_query_bias:  if True, nullify the query bias ``b_Q``.
         fixed_wk_zero_indices: list of Wk *columns* (input coords) to zero, or None.
-        random_wk_zero_rows:   if True, zero 3 random Wk columns.
+        random_wk_zero_rows:   if True, zero ``random_wk_zero_count`` random Wk columns.
+        random_wk_zero_count:  number of random Wk columns to zero (size-matched to (i)).
     """
     attn = layer.self_attn
     seq_len = hidden_states.size(1)
@@ -298,7 +306,8 @@ def manual_self_attention_qwen(hidden_states, layer, num_heads, num_kv_heads, he
     if fixed_wk_zero_indices is not None:
         wk_active[:, fixed_wk_zero_indices] = 0.0
     elif random_wk_zero_rows:
-        random_indices_to_zero = [random.randint(0, hidden_size - 1) for _ in range(3)]
+        random_indices_to_zero = [random.randint(0, hidden_size - 1)
+                                  for _ in range(random_wk_zero_count)]
         wk_active[:, random_indices_to_zero] = 0.0
 
     # Project input to Q, K, V.
@@ -496,22 +505,22 @@ def intervention_h_no_pe(model, token_embeddings, geom):
 
 
 def intervention_i_zero_top_wk(model, token_embeddings, geom):
-    """(i) Zero Top-3 Wk: zero the 3 Wk columns matching the top-3 |dims| of the
-    position-0 token embedding.
+    """(i) Zero Top-3 Wk: zero the Wk columns matching the *massive activations* of the
+    position-0 token embedding — coordinates whose |value| exceeds ``mean + 3·std`` of the
+    embedding's magnitudes (see ``select_massive_coords``; ≥3 by construction).
 
-    GPT-2 zeros the Wk columns aligned with the top-3 dimensions of ``EPE[0]`` — the
-    large-activation coordinates of the effective positional embedding that dominate
-    the key at position 0.  Qwen2.5 has no additive EPE, so the RoPE-model stand-in
-    for "the dimensions that make position 0's key special" is the largest-magnitude
-    coordinates of the first token's residual-stream embedding.  The same columns are
-    zeroed in Wk for every layer.
+    GPT-2 zeros the Wk columns aligned with the massive activations of ``EPE[0]`` — the
+    large-activation coordinates of the effective positional embedding that dominate the
+    key at position 0.  Qwen2.5 has no additive EPE, so the RoPE-model stand-in for "the
+    dimensions that make position 0's key special" is the massive-magnitude coordinates of
+    the first token's residual-stream embedding. Because that embedding is token-dependent,
+    the set is identified per sentence (recorded in run_config.json as a per-sentence
+    method). The same columns are zeroed in Wk for every layer.
     """
     seq_len = token_embeddings.size(1)
     pos = _baseline_position_ids(seq_len, token_embeddings.device)
 
-    sig = token_embeddings[0][0].abs()
-    _, topk_indices = torch.topk(sig, k=3)
-    fixed_wk_zero_indices = topk_indices.tolist()
+    fixed_wk_zero_indices = select_massive_coords(token_embeddings[0][0])
 
     return run_intervention_loop_qwen(
         model, token_embeddings.clone(), geom, pos,
@@ -520,13 +529,15 @@ def intervention_i_zero_top_wk(model, token_embeddings, geom):
 
 
 def intervention_j_zero_random_wk(model, token_embeddings, geom):
-    """(j) Zero Random Wk: zero 3 randomly chosen Wk columns (control for (i))."""
+    """(j) Zero Random Wk: zero ``k`` randomly chosen Wk columns — a size-matched control
+    for (i), where ``k`` is the number of massive coordinates (i) zeroes for this sentence."""
+    k = len(select_massive_coords(token_embeddings[0][0]))
     random.seed(DEFAULT_SEED)
     seq_len = token_embeddings.size(1)
     pos = _baseline_position_ids(seq_len, token_embeddings.device)
     return run_intervention_loop_qwen(
         model, token_embeddings.clone(), geom, pos,
-        attn_kwargs={"random_wk_zero_rows": True},
+        attn_kwargs={"random_wk_zero_rows": True, "random_wk_zero_count": k},
     )
 
 
@@ -725,19 +736,34 @@ def dataset_analysis(model, tokenizer, output_dir, geom,
                      sample_size=DEFAULT_SAMPLE_SIZE,
                      cut_length=DEFAULT_CUT_LENGTH,
                      seed=DEFAULT_SEED,
-                     band=None):
+                     band=None,
+                     model_name=DEFAULT_MODEL,
+                     dtype="float32",
+                     layer_mode="scaled"):
     """Compute the BOS-attention metric on three standard benchmarks (Table 1).
 
     Datasets: SST-2 (natural language), GSM8K (math), HumanEval (code).  Each is
     sampled to *sample_size* examples of at least *cut_length* Qwen tokens, then
     truncated to exactly *cut_length* tokens.  Outputs under
     ``<output_dir>/dataset_analysis_qwen/`` mirror the GPT-2 filenames; the pooled
-    ``bos_attention_summary_mid_layers.{txt,csv}`` is **Table 1** (Qwen2.5).
+    ``bos_attention_summary_mid_layers.{txt,csv}`` is **Table 1** (Qwen2.5). A
+    ``run_config.json`` provenance record is written alongside; because Qwen is RoPE
+    (no additive EPE), intervention (i)'s massive coordinates are the outliers of the
+    *position-0 token embedding* and are identified per sentence, so the record notes the
+    method rather than a fixed coordinate list.
     """
     output_path = Path(output_dir) / "dataset_analysis_qwen"
     output_path.mkdir(parents=True, exist_ok=True)
 
     num_layers = len(model.model.layers)
+
+    run_cfg = build_run_config(
+        model, None, model_name=model_name, dtype=dtype,
+        layer_mode=layer_mode, band=band, seed=seed,
+        sample_size=sample_size, cut_length=cut_length,
+        harness="intervention_analysis_qwen.py",
+        massive_signal="position-0 token embedding (RoPE stand-in; identified per sentence)")
+    (output_path / "run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
 
     sampled, manifest_rows = sample_benchmark_datasets(
         tokenizer, sample_size=sample_size,
@@ -878,6 +904,9 @@ def main():
             cut_length=args.cut_length,
             seed=args.seed,
             band=band,
+            model_name=args.model_name,
+            dtype=args.dtype,
+            layer_mode=args.layer_mode,
         )
 
 

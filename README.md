@@ -185,8 +185,10 @@ the positional interventions are reframed as RoPE **position-id** manipulations:
   (`pos_ids = [1,0,2,3,…]`). Under RoPE the raw-PE vs effective-PE distinction
   collapses, so (d) and (e) coincide; both rows are kept for column alignment.
 - **(h) No PE** → RoPE disabled (`pos_ids = 0` everywhere → identity rotation).
-- **(i) Zero Top-3 Wk** → zeros the Wk columns matching the top-3 magnitude dims of
-  the position-0 token embedding (the RoPE-model stand-in for the top-|EPE[0]| dims).
+- **(i) Zero Top-3 Wk** → zeros the Wk columns matching the *massive activations* of
+  the position-0 token embedding (coordinates whose magnitude exceeds mean + 3·std, the
+  RoPE-model stand-in for the massive |EPE[0]| dims; identified per sentence since Qwen
+  has no additive EPE).
 
 The harness also handles Qwen2.5's grouped-query attention (`repeat_kv`), RMSNorm,
 and SwiGLU FFN. The metric and layer range (4–11) are unchanged; every listed
@@ -356,3 +358,31 @@ python intervention_analysis_opt.py --mode dataset --model-name facebook/opt-2.7
 python residual_sink_analysis.py --mode all --model-name gpt2-xl --output-dir results
 python run_table1_multiseed.py --architecture neo --model EleutherAI/gpt-neo-1.3B --layer-mode scaled
 ```
+
+### Intervention (i) "Zero Top-3 Wk": per-model massive-activation identification
+
+The paper's intervention **(i)** removes the *massive activations* of the effective
+positional embedding `EPE_0 = p_0 + MLP^(0)(p_0)` — the coordinates whose magnitude is a
+statistical outlier, `|EPE_0[d]| > mean + 3·std`. On GPT-2 small there are **exactly
+three** such coordinates (138, 378, 447), so "Zero Top-3 Wk" and "zero the massive
+activations" coincide. Larger or different models generally have a **different number**
+of massive coordinates at **different indices**, so every harness now identifies this set
+per model with the paper's own outlier criterion (identical to E4's
+`residual_sink_analysis.identify_massive_coords`) rather than a blind fixed top-3, and
+zeroes exactly those Wk columns in every layer. The random control **(j)** zeroes an
+**equal number** of random columns, so it stays a size-matched control at every scale.
+
+- This reduces to `{138, 378, 447}` on GPT-2 small, so the paper reproduction is
+  **byte-for-byte unchanged**; e.g. `gpt2-medium` has **6** massive coordinates
+  (`[9, 238, 268, 428, 608, 580]`) and all six are zeroed.
+- A blind top-3 on such models under-ablates and can make the sink *increase* above the
+  baseline (an artifact); zeroing the genuine massive set restores a faithful reduction.
+- Qwen2.5 is RoPE (no additive EPE), so (i)'s massive coordinates are the outliers of the
+  position-0 **token embedding** and are identified per sentence.
+
+Every `--mode dataset` run writes a **`run_config.json`** provenance record next to its
+outputs (under `dataset_analysis[_opt|_neo|_qwen]/`) recording the resolved model
+geometry (`num_layers`, `num_heads`, `hidden_size`, `model_type`), dtype, layer band, and
+the exact massive coordinates and count zeroed by (i)/(j). This makes each run
+self-describing: a mislabeled or duplicated output is immediately detectable (the geometry
+and coordinates would not match the model), and the (i) identification is fully auditable.
