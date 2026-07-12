@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-DEFAULT_SEEDS = [0, 1, 2, 3, 4, 5, 6]
+DEFAULT_SEEDS = [0, 1, 2]
 
 # Per-architecture harness script and the dataset-analysis subdirectory it writes.
 ARCHITECTURES = {
