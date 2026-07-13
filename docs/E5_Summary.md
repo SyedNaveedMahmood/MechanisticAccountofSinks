@@ -68,7 +68,7 @@ claim that the explicit smoke/parity checks passed.
    grows.
 5. **A strong mitigation frontier exists.** Surgical interventions Pareto-dominate
    No-MLP and No-PE. Swap-EPE and Zero-Top-k are the clearest efficient points.
-6. **Relocation is substantially cheaper than deletion.** Swap-EPE removes 93.8% of
+6. **Relocation has substantially lower measured cross-entropy cost than deletion.** Swap-EPE removes 93.8% of
    BOS mass for +0.94 nat, whereas Remove-First-PE removes 97.0% for +3.76 nats.
    Swap-EPE redirects attention locally; deletion sends it broadly to later keys.
 7. **Late-position damage is pathway-specific, not universal.** Nullifying `b_Q`
@@ -410,7 +410,7 @@ The most defensible headline is not simply that sinks can be removed. It is:
 > GPT-2's first-position sink is a robust positional anchoring mechanism whose causal
 > signature survives metric, length, and severe content perturbations, but whose
 > quantitative strength and functional role depend on how the anchor is disrupted.
-> Relocating the anchor preserves function far better than deleting it; removing the
+> Relocating the anchor incurs substantially lower measured language-model cross-entropy cost than deleting it; removing the
 > query-bias pathway exposes content-sensitive residual routing; and the fixed-logit
 > circuit does not obey a simple inverse-competition scaling law.
 

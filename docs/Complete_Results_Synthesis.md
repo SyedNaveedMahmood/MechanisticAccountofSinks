@@ -18,13 +18,13 @@ The original GPT-2-small result reproduces extremely closely, but the new experi
 2. **At least two query-side routes address that anchor.** Pathway A is the paper's source-agnostic `b_Q` route; pathway B is a source-dependent content-query route through the same key. The source-agnostic share falls from **0.561** in GPT-2 small to **0.450** in medium and **0.247** in large, while nullifying `b_Q` leaves **44.5%, 70.4%, and 74.0%** of baseline respectively.
 3. **The function is much more universal than its parameterization.** GPT-Neo has no query bias and its `b` intervention is exactly a no-op, yet removing the first positional identity leaves only **5.9%, 2.4%, and 2.2%** of baseline. Qwen/RoPE often depends strongly on query bias but not on the additive-PE interventions. OPT is heterogeneous, and OPT-13B's targeted `W_k` edit *increases* the sink to **110.1%**. There is no architecture-independent intervention signature.
 4. **The mechanism is learned non-monotonically.** Across **5 Mistral training runs × 17 checkpoints = 85/85 successful checkpoints**, the sink rises from **0.0344±0.0006** to **0.8968±0.0076**. Massive activations overshoot to **10.1958±3.7878** at 40k steps and relax to **1.3601±0.0397** by 400k. Early training even shows strong anti-alignment (**−0.6160±0.1551** at step 400).
-5. **Exact coordinates are arbitrary.** The final top-3 massive-coordinate sets have pairwise Jaccard **0** across all five training runs. The learned computational role is stable; the coordinate labels are not.
+5. **Exact coordinate identities are not reproducible across independently trained runs.** The final top-3 massive-coordinate sets have pairwise Jaccard **0** across all five training runs. This establishes non-reproducibility of the labels, not an absence of underlying structure in how coordinates are selected.
 6. **The sink survives long context, but not by a simple inverse-competition law.** Baseline BOS attention falls only **23.7%**, from **0.5625** at length 40 to **0.4294** at 1024 while context grows **25.6×**. The across-length logit slope is **−0.166**, not −1; within-length mean slopes flatten from **−0.336** to **−0.107**.
-7. **Relocation is much cheaper than deletion.** Swap-EPE removes **93.8%** of BOS mass for **+0.938 nat**, whereas Remove-First-PE removes **97.0%** for **+3.757 nats**. The model appears to benefit from retaining a concentrated anchor more than from anchoring specifically at BOS.
+7. **Relocation has substantially lower measured cross-entropy cost than deletion.** Swap-EPE removes **93.8%** of BOS mass for **+0.938 nat**, whereas Remove-First-PE removes **97.0%** for **+3.757 nats**. The model appears to benefit from retaining a concentrated anchor more than from anchoring specifically at BOS.
 8. **Location is positional; strength and routing are content-sensitive.** Remove-First-PE remains devastating on every tested content regime (**2.1–4.3%** of each regime's baseline), but the residual after nullifying `b_Q` rises from **44.4%** on natural text to **55.1%** on uniform random tokens and **57.4%** on repeated tokens.
 9. **Coarse ablations are poor mechanistic evidence.** No-MLP and No-PE are about **10×** more sampling-variable than surgical edits, strongly domain-dependent, and functionally costly. E5 measures costs of **+9.497** and **+5.536 nats** respectively.
 
-The revised claim is therefore: **attention sinks are a robust positional anchoring function implemented by architecture- and training-dependent circuits; in GPT-2, two query-side pathways converge on a shared EPE-derived key object.**
+The revised claim is therefore: **across the tested decoder-only model families, attention sinks are recurring anchoring behaviours with architecture- and training-dependent implementations. In GPT-2, the anchor is an EPE-derived positional key addressed through both a fixed query-bias pathway and a source-dependent content-query pathway.**
 
 ## Common setup and intervention key
 
@@ -327,7 +327,7 @@ The intervention/alignment trajectory is:
 
 Here efficacy is fractional sink reduction, so **0.9934** means a **99.34%** reduction and **0.0531** means only **5.31%**.
 
-### 4.3 Converged runs and coordinate arbitrariness
+### 4.3 Converged runs and non-reproducible coordinate identities
 
 | run | sink | EPE max | A align | Δ dominance | B query align | all >3σ coordinates | final top-3 |
 |---|---:|---:|---:|---:|---:|---|---|
@@ -337,7 +337,7 @@ Here efficacy is fractional sink reduction, so **0.9934** means a **99.34%** red
 | darkmatter | .885707 | 1.307611 | .761505 | .558917 | .276382 | 100,192,256,470,532,610,667,700,751 | 610,470,192 |
 | expanse | .902059 | 1.359967 | .772573 | .571062 | .257133 | 41,209,218,233,435,529,595 | 529,233,41 |
 
-All **10 pairwise top-3 Jaccards are 0**. Only coordinate **545** overlaps even in the wider >3σ sets (alias/battlestar). Coordinate identity is therefore a symmetry-broken implementation detail, not a reproducible semantic feature.
+All **10 pairwise top-3 Jaccards are 0**. Only coordinate **545** overlaps even in the wider >3σ sets (alias/battlestar). Exact coordinate identities are therefore not reproducible across these independently trained runs. This result does not imply that coordinate selection is unstructured or intrinsically arbitrary.
 
 ### 4.4 Onset, maximum-slope timing, and temporal stability
 
@@ -821,7 +821,7 @@ At n=300 all large causal effects are easily resolvable. The observed e–f gap 
 | Damage concentrates late at long context | pathway-specific | true for b at 1024 (late 1.093), not c/i |
 | Signature is content-invariant | strict version rejected | b shifts +10.7/+13.0 pp on uniform/repeated input |
 
-E5 adds the functional interpretation missing from the original paper: a concentrated anchor appears useful, but its exact location is negotiable. The most effective mitigation should **attenuate or relocate** a sink, not indiscriminately destroy the positional object or whole computation blocks.
+E5 adds the functional interpretation missing from the original paper: a concentrated anchor appears useful, but its exact location is negotiable. On the measured sink-reduction–cross-entropy frontier, attenuation and relocation outperform deletion of the positional object and global ablation of whole computation blocks.
 
 ---
 
@@ -856,20 +856,20 @@ The complete evidence supports a hierarchy rather than a binary generalization v
 | level | generalizes? | evidence |
 |---|---|---|
 | Sink phenomenon | strongly | baseline .271–.677 across all 16 E1/E2 models; .429 at GPT-2 length 1024 |
-| Early-position anchoring function | strongly | relocation, content stress tests, c across GPT-2/Neo, sinks in RoPE models |
+| Recurring early-position sink/anchoring behaviour | strongly | sinks recur across all tested families and persist under length/content stress tests in GPT-2 |
 | Positional key identity in absolute-PE GPT-like models | often | c leaves 2–6% in GPT-2 and Neo; d often relocates/removes |
 | Two query-side routes in GPT-2 | strongly | exact score decomposition, combined interventions, scale trend |
 | Dominance of `b_Q` route | no | GPT-2 residual grows with scale; Mistral b efficacy is 5.31%; Neo has no `b_Q` |
 | Same raw intervention semantics across families | no | Qwen c/d/e and i differ; OPT e is often non-neutral |
 | Same massive coordinate labels | decisively no | all 10 E3 top-3 pairwise Jaccards are 0 |
 
-The paper's final architectural caution is therefore validated: optimization can build an anchoring computation from whatever components an architecture supplies.
+The paper's architectural caution is supported: the same recurring sink behaviour coexists with different active components across families. A shared positional-anchor object outside GPT-2 remains a hypothesis rather than a result established by these intervention analogues.
 
 ### 7.3 Emergence explains apparent cross-model disagreement
 
 Static checkpoints can make different mechanisms look categorically unrelated, but E3 shows that pathway balance itself is a moving target. The content route becomes effective early, the bias/EPE route passes through anti-alignment, massive coordinates overshoot by almost an order of magnitude, and the final model compresses their amplitude while strengthening the sink. Two checkpoints with the same sink strength could therefore have different internal balances, and two training runs can implement the same balance in disjoint coordinates.
 
-This makes the cross-architecture results less mysterious. GPT-Neo realizes an anchor without `b_Q`; Qwen often relies heavily on a learned query bias plus token/MLP structure under RoPE; OPT switches among PE/EPE/MLP/key routes with scale. These are alternative points in a broader implementation space, not necessarily unrelated phenomena.
+The cross-architecture results establish recurring sink behaviour with distinct intervention signatures. GPT-Neo has no `b_Q`; Qwen often depends strongly on learned query bias plus token/MLP structure under RoPE; OPT changes sharply across scale. These are evidence for architecture-specific implementations, but they do not directly establish the same positional-anchor object in every family. Qwen's operations in particular are causal analogues, not equivalents of GPT-2's EPE interventions.
 
 ### 7.4 Content independence must be split into location and strength
 
@@ -898,7 +898,7 @@ Thus a low BOS-attention number is not automatically a better model state. Any p
 2. **Residual mechanism:** GPT-2's residual sink is a second, content-query route to the same EPE-derived key object.
 3. **Scale:** the source-agnostic share decreases with GPT-2 scale; the shared positional anchor persists.
 4. **Architecture:** no single intervention signature is universal; ingredient-aware interventions reveal alternative circuits.
-5. **Learning:** sink formation is non-monotonic and coordinate-degenerate across independently trained runs.
+5. **Learning:** sink formation is non-monotonic, and exact coordinate identities are not reproducible across independently trained runs.
 6. **Robustness:** the anchor survives length and severe content perturbations, while effect magnitude is metric-, length-, domain-, and content-sensitive.
 7. **Function:** relocation and graded attenuation dominate deletion/global ablation on the sink-removal–CE frontier.
 
@@ -992,6 +992,6 @@ The raw per-example, per-head-cell, query-position, and token-position CSVs rema
 
 ## Final finding
 
-The reproduction does more than confirm the paper. It preserves the original GPT-2 mechanism, explains its residual, identifies its training dynamics and coordinate degeneracy, maps its architectural boundary, rejects an overly simple context-length law, and attaches a functional cost to mitigation. The most coherent account across every experiment is:
+The reproduction does more than confirm the paper. It preserves the original GPT-2 mechanism, explains its residual, identifies its training dynamics and non-reproducible coordinate identities, maps its architectural boundary, rejects an overly simple context-length law, and attaches a measured cross-entropy cost to mitigation. The most coherent account across every experiment is:
 
-> **Attention sinks are learned positional anchors. GPT-2 realizes the anchor through an EPE-derived key reached by both a fixed query-bias route and a content-query route. Training, scale, architecture, context, and content change the route balance and parameterization, while the anchoring function persists. Relocating or gently attenuating that function is substantially safer than deleting it.**
+> **Across the tested decoder-only model families, attention sinks are recurring anchoring behaviours with architecture- and training-dependent implementations. In GPT-2, the anchor is an EPE-derived positional key addressed through both a fixed query-bias pathway and a source-dependent content-query pathway. Relocation has substantially lower measured cross-entropy cost than deletion.**
