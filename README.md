@@ -2,11 +2,15 @@ Code for reproducing the experiments in the paper "A Mechanistic Account of Atte
 
 ## Repository layout
 
-The code is organized into one self-contained folder per experiment group. Each folder
-carries the scripts it needs, so you `cd` into a folder and run its commands from there.
+The code is organized into one folder per experiment group. The analysis modules that
+every group shares (`datasets_loader.py`, `intervention_analysis.py`,
+`residual_sink_analysis.py`, `experiments_single_input.py`) are kept as a single master
+copy under [`common/`](common/); each experiment script adds `common/` to its import
+path automatically, so you still `cd` into a folder and run its commands from there.
 
 | Folder | Purpose |
 | --- | --- |
+| [`common/`](common/) | Shared master modules imported by every experiment group: dataset loading, the GPT-2 intervention harness (also the Fig 5 / Table 1 entry point), the residual-sink harness (E4), and single-input helpers (Fig 2 / Fig 7). |
 | [`reproduce_paper/`](reproduce_paper/) | Reproduce the original paper's figures and tables (GPT-2 small). |
 | [`cross_scale_and_architecture/`](cross_scale_and_architecture/) | Cross-scale + cross-architecture Table 1 sweep (GPT-2 / OPT / GPT-Neo / Qwen2.5) via the multiseed runner. |
 | [`emergence_dynamics/`](emergence_dynamics/) | **E3** — training-time emergence dynamics of the sink circuit. |
@@ -53,7 +57,7 @@ Outputs:
 ### Figure 2 — EPE-Bias Projection Alignment
 
 ```bash
-python experiments_single_input.py --mode epe-bias-proj --output-dir results
+python ../common/experiments_single_input.py --mode epe-bias-proj --output-dir results
 ```
 
 Output:
@@ -82,7 +86,7 @@ Outputs:
 ### Figure 5 — Intervention Attention Maps
 
 ```bash
-python intervention_analysis.py --mode sentence --output-dir results
+python ../common/intervention_analysis.py --mode sentence --output-dir results
 ```
 
 Outputs:
@@ -91,7 +95,7 @@ Outputs:
 ### Table 1 — BOS Attention Statistics
 
 ```bash
-python intervention_analysis.py --mode dataset --output-dir results
+python ../common/intervention_analysis.py --mode dataset --output-dir results
 ```
 
 Outputs:
@@ -101,7 +105,7 @@ Outputs:
 ### Figure 7 (appendix) — Massive Activations in EPE_1
 
 ```bash
-python experiments_single_input.py --mode massive-activations --output-dir results
+python ../common/experiments_single_input.py --mode massive-activations --output-dir results
 ```
 
 Output:
@@ -207,7 +211,7 @@ relocation) over seeds `0,1,2` by default. See [`.md/E4_Plan.md`](.md/E4_Plan.md
 full account.
 
 ```bash
-python residual_sink_analysis.py --mode all --model-name gpt2 --seeds 0,1,2 --output-dir results/e4_residual_sink_gpt2
+python ../common/residual_sink_analysis.py --mode all --model-name gpt2 --seeds 0,1,2 --output-dir results/e4_residual_sink_gpt2
 ```
 
 Add `--with-perplexity` to include the optional functional-cost (LM cross-entropy) table.

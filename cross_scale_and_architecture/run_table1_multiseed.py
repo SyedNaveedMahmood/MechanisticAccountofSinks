@@ -11,7 +11,7 @@ creates scatter plots for every numeric metric.
 ``--architecture`` selects which intervention harness to drive and which output
 subdirectory to read back:
 
-    gpt2  → gpt2/intervention_analysis.py       (results/.../dataset_analysis/)
+    gpt2  → ../common/intervention_analysis.py  (results/.../dataset_analysis/)
     opt   → opt/intervention_analysis_opt.py    (results/.../dataset_analysis_opt/)
     neo   -> neo/intervention_analysis_neo.py   (results/.../dataset_analysis_neo/)
     qwen  -> qwen/intervention_analysis_qwen.py (results/.../dataset_analysis_qwen/)
@@ -39,7 +39,7 @@ DEFAULT_SEEDS = [0, 1, 2, 3, 4, 5, 6]
 # Per-architecture harness script and the dataset-analysis subdirectory it writes.
 ARCHITECTURES = {
     "gpt2": {
-        "script": "gpt2/intervention_analysis.py",
+        "script": "../common/intervention_analysis.py",
         "dataset_dir": "dataset_analysis",
         "default_model": "gpt2",
     },
@@ -268,7 +268,7 @@ def main() -> None:
         "--architecture",
         choices=sorted(ARCHITECTURES),
         default=DEFAULT_ARCHITECTURE,
-        help="Which intervention harness to drive: 'gpt2' (intervention_analysis.py), "
+        help="Which intervention harness to drive: 'gpt2' (../common/intervention_analysis.py), "
              "'opt' (intervention_analysis_opt.py), 'neo' (intervention_analysis_neo.py), "
              "or 'qwen' (intervention_analysis_qwen.py). Default: gpt2.",
     )
