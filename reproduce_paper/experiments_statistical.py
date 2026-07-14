@@ -28,6 +28,17 @@ import argparse
 from pathlib import Path
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
+# Shared analysis modules live in the repository's top-level ``common/`` folder
+# (one master copy each). Make them importable regardless of the launch directory.
+import os
+import sys
+
+_COMMON_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "common")
+)
+if _COMMON_DIR not in sys.path:
+    sys.path.insert(0, _COMMON_DIR)
+
 from datasets_loader import (
     sample_benchmark_datasets,
     DEFAULT_SAMPLE_SIZE,
