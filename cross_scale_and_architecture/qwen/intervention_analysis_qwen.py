@@ -136,33 +136,18 @@ _DTYPE_MAP = {
 # Model loading (with Qwen2-family structural guard)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_qwen(model_name, dtype="float32"):
-    """Load a Qwen2.5 model + tokenizer and assert it matches the harness's assumptions.
+def guard_qwen(model, model_name):
+    """Assert *model* matches the Qwen2 pre-RMSNorm decoder this harness assumes.
 
-    The harness assumes the Qwen2 pre-RMSNorm decoder block
+    The harness assumes the block
     ``x = x + attn(input_layernorm(x)); x = x + mlp(post_attention_layernorm(x))``
     with separate q/k/v/o projections and a learned query bias.  We validate that
-    structure up front so an unexpected architecture fails loudly rather than
-    silently producing wrong numbers.
+    structure up front so an unexpected architecture fails loudly rather than silently
+    producing wrong numbers.
+
+    Split out of :func:`load_qwen` so the NNsight loader applies the identical check to
+    the underlying HF module tree.
     """
-    print(f"Loading {model_name} ...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if dtype == "auto":
-        torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    else:
-        if dtype not in _DTYPE_MAP:
-            raise ValueError(f"--dtype must be one of {list(_DTYPE_MAP)} or 'auto', got {dtype!r}")
-        torch_dtype = _DTYPE_MAP[dtype]
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, attn_implementation="eager", torch_dtype=torch_dtype
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
-
-    # --- structural validation -------------------------------------------------
     inner = getattr(model, "model", None)
     if inner is None or not hasattr(inner, "layers") or not hasattr(inner, "embed_tokens"):
         raise ValueError(
@@ -183,6 +168,31 @@ def load_qwen(model_name, dtype="float32"):
     for norm in ("input_layernorm", "post_attention_layernorm"):
         if not hasattr(layer0, norm):
             raise ValueError(f"{model_name}: decoder layer is missing {norm}; not a Qwen2-style model.")
+
+
+def resolve_qwen_dtype(dtype, device):
+    """Map the Qwen ``--dtype`` flag (which uniquely supports 'auto') to a torch dtype."""
+    if dtype == "auto":
+        return torch.float16 if device.type == "cuda" else torch.float32
+    if dtype not in _DTYPE_MAP:
+        raise ValueError(f"--dtype must be one of {list(_DTYPE_MAP)} or 'auto', got {dtype!r}")
+    return _DTYPE_MAP[dtype]
+
+
+def load_qwen(model_name, dtype="float32"):
+    """Load a Qwen2.5 model + tokenizer and assert it matches the harness's assumptions."""
+    print(f"Loading {model_name} ...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch_dtype = resolve_qwen_dtype(dtype, device)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, attn_implementation="eager", torch_dtype=torch_dtype
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model.to(device)
+    model.eval()
+
+    guard_qwen(model, model_name)
 
     cfg = model.config
     head_dim = getattr(cfg, "head_dim", None) or (cfg.hidden_size // cfg.num_attention_heads)
@@ -720,8 +730,51 @@ def sentence_analysis(model, tokenizer, sentence, output_dir, geom):
 # Mode 2 — Dataset analysis (Table 1: three benchmark datasets, per-dataset + pooled)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, geom, band=None):
-    """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}."""
+def make_manual_runner_qwen(model, geom):
+    """The default ``run_interventions`` closure: the hand-rolled Qwen forward pass."""
+    def _run(inputs):
+        token_embeddings = get_token_embeddings_qwen(model, inputs)
+        return run_all_interventions(model, token_embeddings, geom)
+    return _run
+
+
+def make_nnsight_runner_qwen(engine, model):
+    """Factory for the NNsight ``run_interventions`` closure (Qwen2.5).
+
+    Qwen differs from the other three families in two ways this closure preserves:
+
+    * **Massive coordinates are per-sentence.** Qwen has no additive EPE, so the manual
+      harness uses the *position-0 token embedding* as the RoPE stand-in for "the
+      dimensions that make position 0's key special". That is token-dependent, so the set
+      is re-identified for every sentence rather than once per model.
+    * **No swap directions.** (c)/(d)/(e)/(h) are RoPE position-id manipulations handled
+      inside the engine's payload, not residual-stream edits, so there is no EPE/PE
+      direction to supply.
+    """
+    embed = model.model.embed_tokens
+
+    def _make(_massive_coords_unused):
+        def _run(inputs):
+            # Plain embedding lookup rather than get_token_embeddings_qwen: identical
+            # tensor, without spending a full forward pass to fire a hook.
+            with torch.no_grad():
+                te = embed(inputs["input_ids"])
+            massive = select_massive_coords(te[0][0])
+            return engine.run_all(inputs, massive_coords=massive, swap_dirs={})
+        return _run
+    return _make
+
+
+def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, geom, band=None,
+                   run_interventions=None):
+    """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}.
+
+    ``run_interventions(inputs) -> {key: [per-layer attn tensors]}`` is the execution
+    engine; it defaults to the manual forward pass. The NNsight engine satisfies the same
+    contract, so everything below this seam is engine-agnostic.
+    """
+    if run_interventions is None:
+        run_interventions = make_manual_runner_qwen(model, geom)
     ls, le = band if band is not None else (None, None)
     scores_mid = {key: [] for key, *_ in INTERVENTIONS}
     scores_all = {key: [] for key, *_ in INTERVENTIONS}
@@ -730,8 +783,7 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, geom, band
         print(f"  [{ds_label} {i + 1}/{n}] {sentence[:80]}...")
         inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
         inputs = inputs.to(model.device)
-        token_embeddings = get_token_embeddings_qwen(model, inputs)
-        results = run_all_interventions(model, token_embeddings, geom)
+        results = run_interventions(inputs)
         for key, *_ in INTERVENTIONS:
             scores_mid[key].append(
                 compute_bos_attention_metric(results[key], num_layers, "mid",
@@ -750,7 +802,10 @@ def dataset_analysis(model, tokenizer, output_dir, geom,
                      band=None,
                      model_name=DEFAULT_MODEL,
                      dtype="float32",
-                     layer_mode="scaled"):
+                     layer_mode="scaled",
+                     engine="manual",
+                     engine_info=None,
+                     make_runner=None):
     """Compute the BOS-attention metric on three standard benchmarks (Table 1).
 
     Datasets: SST-2 (natural language), GSM8K (math), HumanEval (code).  Each is
@@ -773,8 +828,13 @@ def dataset_analysis(model, tokenizer, output_dir, geom,
         layer_mode=layer_mode, band=band, seed=seed,
         sample_size=sample_size, cut_length=cut_length,
         harness="intervention_analysis_qwen.py",
-        massive_signal="position-0 token embedding (RoPE stand-in; identified per sentence)")
+        massive_signal="position-0 token embedding (RoPE stand-in; identified per sentence)",
+        engine=engine, engine_info=engine_info)
     (output_path / "run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
+
+    # Qwen identifies massive coords per sentence, so nothing is threaded in here; the
+    # factory signature is kept uniform with the other harnesses.
+    run_interventions = make_runner(None) if make_runner is not None else None
 
     sampled, manifest_rows = sample_benchmark_datasets(
         tokenizer, sample_size=sample_size,
@@ -790,7 +850,8 @@ def dataset_analysis(model, tokenizer, output_dir, geom,
         print(f"\n{'═'*60}")
         print(f"  Dataset: {ds_name}  ({len(sentences)} examples)")
         print(f"{'═'*60}")
-        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, geom, band=band)
+        s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers, geom,
+                                      band=band, run_interventions=run_interventions)
         all_mid[ds_name] = s_mid
         all_scope[ds_name] = s_all
 
@@ -898,17 +959,76 @@ def main():
              "(= layers 4-11 for a 12-layer model; extends for the deeper Qwen2.5 checkpoints, "
              "all ≥24 layers); 'fixed' forces layers 4-11 on every size.",
     )
+    parser.add_argument(
+        "--engine",
+        choices=["manual", "nnsight"],
+        default="manual",
+        help="Execution engine. 'manual' (default) re-implements the forward pass by hand "
+             "(including RoPE and GQA) and reproduces the published Table-1 numbers. "
+             "'nnsight' runs the real HuggingFace forward under NNsight, so RoPE/GQA come "
+             "from the model itself and the positional interventions become position_ids.",
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Execute the NNsight engine remotely on NDIF (requires --engine nnsight).",
+    )
+    parser.add_argument(
+        "--verify-parity",
+        action="store_true",
+        help="Cross-check the NNsight engine against the manual forward pass and write "
+             "parity_report.json. fp32 only.",
+    )
     args = parser.parse_args()
 
-    model, tokenizer = load_qwen(args.model_name, dtype=args.dtype)
+    if args.remote and args.engine != "nnsight":
+        parser.error("--remote requires --engine nnsight")
+
+    engine_info = None
+    nn_engine = None
+    if args.engine == "nnsight" or args.verify_parity:
+        from nnsight_engine import ARCH_SPECS, NNsightEngine, load_nnsight_model
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch_dtype = resolve_qwen_dtype(args.dtype, device)
+        spec = ARCH_SPECS["qwen"]
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        lm = load_nnsight_model(spec, args.model_name, dtype=torch_dtype, tokenizer=tokenizer,
+                                device=device, remote=args.remote, guard=guard_qwen)
+        model = lm._model
+        nn_engine = NNsightEngine(lm, spec, remote=args.remote)
+        engine_info = nn_engine.engine_info() if args.engine == "nnsight" else None
+    else:
+        model, tokenizer = load_qwen(args.model_name, dtype=args.dtype)
+
     geom = _model_geometry(model)
     num_layers = len(model.model.layers)
     band = compute_band(num_layers, args.layer_mode)
     print(f"Layers: {num_layers}; mid-band [{band[0]}, {band[1]}) (layer-mode {args.layer_mode}).\n")
 
+    if args.verify_parity:
+        from nnsight_engine import run_parity_check
+        # Qwen's massive coords are per-sentence (position-0 token embedding), but the
+        # parity harness needs one set to size the (j) control; use the first sentence's.
+        from nnsight_engine import PARITY_SENTENCES
+        probe = tokenizer(PARITY_SENTENCES[0], return_tensors="pt",
+                          add_special_tokens=False).to(model.device)
+        with torch.no_grad():
+            probe_te = model.model.embed_tokens(probe["input_ids"])
+        run_parity_check(
+            nn_engine, model, tokenizer, band, num_layers,
+            manual_runner_factory=lambda _mc: make_manual_runner_qwen(model, geom),
+            swap_dirs={},                       # RoPE: positional edits are position_ids
+            massive_coords=select_massive_coords(probe_te[0][0]),
+            dtype=args.dtype, output_dir=args.output_dir,
+            sentences=PARITY_SENTENCES[:1],     # coords are per-sentence; keep it to one
+        )
+        return
+
     if args.mode == "sentence":
         sentence_analysis(model, tokenizer, args.sentence, args.output_dir, geom)
     else:
+        make_runner = (make_nnsight_runner_qwen(nn_engine, model)
+                       if args.engine == "nnsight" else None)
         dataset_analysis(
             model, tokenizer, args.output_dir, geom,
             sample_size=args.sample_size,
@@ -918,6 +1038,9 @@ def main():
             model_name=args.model_name,
             dtype=args.dtype,
             layer_mode=args.layer_mode,
+            engine=args.engine,
+            engine_info=engine_info,
+            make_runner=make_runner,
         )
 
 

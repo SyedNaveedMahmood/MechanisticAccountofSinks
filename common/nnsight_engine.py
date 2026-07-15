@@ -584,7 +584,7 @@ ATTN_RTOL = 1e-5
 def verify_parity(engine: "NNsightEngine", manual_runner: Callable, inputs_list: Sequence,
                   band, num_layers: int, *, massive_coords=None, swap_dirs=None,
                   metric_atol: float = METRIC_ATOL, metric_rtol: float = METRIC_RTOL,
-                  strict: bool = True) -> dict:
+                  strict: bool = True, raise_on_fail: bool = True) -> dict:
     """Compare the NNsight engine against the manual harness, per intervention.
 
     Two tiers, following the conventions of ``evaluation_robustness_analysis.verify_parity``:
@@ -658,7 +658,7 @@ def verify_parity(engine: "NNsightEngine", manual_runner: Callable, inputs_list:
         "rows": rows,
         "all_rows_pass": all(r["status"] == "pass" for r in rows),
     }
-    if strict and not report["all_rows_pass"]:
+    if strict and raise_on_fail and not report["all_rows_pass"]:
         failed = [r["intervention"] for r in rows if r["status"] != "pass"]
         raise AssertionError(
             f"NNsight parity failed for {engine.spec.name}: {failed}. "
@@ -705,9 +705,12 @@ def run_parity_check(engine, model, tokenizer, band, num_layers, *,
         enc = tokenizer(s, return_tensors="pt", add_special_tokens=False)
         inputs_list.append(enc.to(model.device))
 
+    # raise_on_fail=False: a failing report is the *evidence*, so it must be written to
+    # disk before anything raises. We re-raise below, after saving.
     report = verify_parity(
         engine, manual_runner_factory(massive_coords), inputs_list, band, num_layers,
         massive_coords=massive_coords, swap_dirs=swap_dirs, strict=strict,
+        raise_on_fail=False,
     )
 
     print(f"\n{'key':7s} {'max|d| attn':>13s} {'max|d| metric':>14s} {'max rel':>10s}  status")
@@ -723,4 +726,12 @@ def run_parity_check(engine, model, tokenizer, band, num_layers, *,
     out.mkdir(parents=True, exist_ok=True)
     (out / "parity_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"\nParity report written to {out / 'parity_report.json'}")
+
+    if strict and not report["all_rows_pass"]:
+        failed = [r["intervention"] for r in report["rows"] if r["status"] != "pass"]
+        raise AssertionError(
+            f"NNsight parity failed for {engine.spec.name}: {failed}. "
+            f"The real HF forward is ground truth here — investigate the manual path. "
+            f"Report saved to {out / 'parity_report.json'}."
+        )
     return report
