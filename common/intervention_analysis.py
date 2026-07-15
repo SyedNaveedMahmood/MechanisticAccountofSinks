@@ -1062,62 +1062,6 @@ def dataset_analysis(model, tokenizer, output_dir,
     print(f"\nAll outputs saved to {output_path}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Parity check (--verify-parity)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-PARITY_SENTENCES = [
-    DEFAULT_SENTENCE,
-    "def solve(n):\n    total = 0\n    for i in range(n):\n        total += i * i\n    return total",
-    "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May.",
-]
-
-
-def run_parity_check(engine, model, tokenizer, band, num_layers, *, dtype="float32",
-                     output_dir="results"):
-    """Cross-check the NNsight engine against the manual forward pass.
-
-    This is the artifact that makes the hand-rolled re-implementation auditable rather than
-    merely trusted: the real HuggingFace forward is the ground truth, so any fp32
-    divergence is a finding about the manual path, not a nuisance to tune away.
-    """
-    from nnsight_engine import verify_parity
-
-    strict = dtype == "float32"
-    if not strict:
-        print(f"[parity] dtype={dtype}: downgrading to ADVISORY. In half precision the "
-              f"manual path and HF are different algorithms (HF upcasts q/k and softmax "
-              f"to fp32), so deviation here is expected and not a defect.")
-
-    massive_coords = identify_massive_coords(model, tokenizer)
-    print(f"[parity] massive coords ({len(massive_coords)}): {massive_coords}")
-
-    inputs_list = []
-    for s in PARITY_SENTENCES:
-        enc = tokenizer(s, return_tensors="pt", add_special_tokens=False)
-        inputs_list.append(enc.to(model.device))
-
-    report = verify_parity(
-        engine, make_manual_runner(model, massive_coords), inputs_list, band, num_layers,
-        massive_coords=massive_coords, swap_dirs=gpt2_swap_directions(model), strict=strict,
-    )
-
-    print(f"\n{'key':7s} {'max|d| attn':>13s} {'max|d| metric':>14s} {'max rel':>10s}  status")
-    print("-" * 60)
-    for r in report["rows"]:
-        print(f"{r['intervention']:7s} {r['max_abs_attention_difference']:13.3e} "
-              f"{r['max_abs_metric_deviation']:14.3e} {r['max_rel_metric_deviation']:10.3e}"
-              f"  {r['status']}")
-    print("-" * 60)
-    print(f"all rows pass: {report['all_rows_pass']}")
-
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "parity_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"\nParity report written to {out / 'parity_report.json'}")
-    return report
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1242,8 +1186,14 @@ def main():
           f"(layer-mode {args.layer_mode}).\n")
 
     if args.verify_parity:
-        run_parity_check(nn_engine, model, tokenizer, band, num_layers,
-                         dtype=args.dtype, output_dir=args.output_dir)
+        from nnsight_engine import run_parity_check
+        run_parity_check(
+            nn_engine, model, tokenizer, band, num_layers,
+            manual_runner_factory=lambda mc: make_manual_runner(model, mc),
+            swap_dirs=gpt2_swap_directions(model),
+            massive_coords=identify_massive_coords(model, tokenizer),
+            dtype=args.dtype, output_dir=args.output_dir,
+        )
         return
 
     if args.mode == "sentence":

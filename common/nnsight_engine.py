@@ -602,6 +602,15 @@ def verify_parity(engine: "NNsightEngine", manual_runner: Callable, inputs_list:
     A divergence in fp32 *is* meaningful: the real HF forward is ground truth, so a
     mismatch means the hand-rolled re-implementation deviates from the model the paper
     claims to describe.
+
+    Why the gate is the metric and not the raw probabilities: on GPT-Neo, ``int_d`` shows
+    a max per-cell deviation of ~4e-2 while its BOS metric agrees to ~3e-6. That is not a
+    defect. GPT-Neo omits the ``1/sqrt(head_dim)`` scale, so its logits are ~8x larger and
+    the softmax is near one-hot (mean max-per-row ~0.97); a layer-1 rounding difference
+    then amplifies chaotically with depth (measured: layer 0 deviation is *exactly* zero,
+    growing monotonically to ~1e-2 by layer 8). Individual attention cells are chaotic
+    under any perturbation; the metric — an average over heads, second-half tokens and the
+    layer band — is not. Gating on per-cell probabilities would flag physics as a bug.
     """
     from intervention_analysis import compute_bos_attention_metric
 
@@ -655,4 +664,63 @@ def verify_parity(engine: "NNsightEngine", manual_runner: Callable, inputs_list:
             f"NNsight parity failed for {engine.spec.name}: {failed}. "
             "The real HF forward is ground truth here — investigate the manual path."
         )
+    return report
+
+
+# Three sentences spanning the paper's three domains (natural language, code, math), so a
+# parity check exercises the same input distribution the Table-1 sweep does.
+PARITY_SENTENCES = [
+    "It was the best of times, it was the worst of times, it was the age of wisdom.",
+    "def solve(n):\n    total = 0\n    for i in range(n):\n        total += i * i\n    return total",
+    "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May.",
+]
+
+
+def run_parity_check(engine, model, tokenizer, band, num_layers, *,
+                     manual_runner_factory, swap_dirs, massive_coords,
+                     dtype: str = "float32", output_dir: str = "results",
+                     sentences: Optional[Sequence[str]] = None) -> dict:
+    """Driver for ``--verify-parity``: run both engines, print a table, save a report.
+
+    Shared by all four harnesses; each supplies its own ``manual_runner_factory``,
+    ``swap_dirs`` and ``massive_coords`` because each derives them differently.
+
+    This is the artifact that makes the hand-rolled re-implementation auditable rather than
+    merely trusted. The real HuggingFace forward is ground truth, so an fp32 divergence is
+    a finding about the manual path, not a nuisance to tune away.
+    """
+    import json
+    from pathlib import Path
+
+    strict = dtype == "float32"
+    if not strict:
+        print(f"[parity] dtype={dtype}: gate downgraded to ADVISORY. In half precision the "
+              f"manual path and HF are different algorithms (HF upcasts q/k and/or softmax "
+              f"to fp32), so deviation here is expected and is not a defect.")
+
+    print(f"[parity] massive coords ({len(massive_coords)}): {massive_coords}")
+
+    inputs_list = []
+    for s in (sentences or PARITY_SENTENCES):
+        enc = tokenizer(s, return_tensors="pt", add_special_tokens=False)
+        inputs_list.append(enc.to(model.device))
+
+    report = verify_parity(
+        engine, manual_runner_factory(massive_coords), inputs_list, band, num_layers,
+        massive_coords=massive_coords, swap_dirs=swap_dirs, strict=strict,
+    )
+
+    print(f"\n{'key':7s} {'max|d| attn':>13s} {'max|d| metric':>14s} {'max rel':>10s}  status")
+    print("-" * 60)
+    for r in report["rows"]:
+        print(f"{r['intervention']:7s} {r['max_abs_attention_difference']:13.3e} "
+              f"{r['max_abs_metric_deviation']:14.3e} {r['max_rel_metric_deviation']:10.3e}"
+              f"  {r['status']}")
+    print("-" * 60)
+    print(f"all rows pass: {report['all_rows_pass']}")
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "parity_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"\nParity report written to {out / 'parity_report.json'}")
     return report

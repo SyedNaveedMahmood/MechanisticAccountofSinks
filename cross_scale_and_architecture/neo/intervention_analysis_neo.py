@@ -669,9 +669,56 @@ def sentence_analysis(model, tokenizer, sentence, output_dir, num_heads):
 # Mode 2 — Dataset analysis (Table 1: three benchmark datasets, per-dataset + pooled)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def make_manual_runner_neo(model, num_heads, massive_coords=None):
+    """The default ``run_interventions`` closure: the hand-rolled GPT-Neo forward pass."""
+    def _run(inputs):
+        pos_enc, token_embeddings = get_initial_embeddings_neo(model, inputs)
+        return run_all_interventions(model, token_embeddings, pos_enc, num_heads,
+                                     massive_coords=massive_coords)
+    return _run
+
+
+def neo_swap_directions(model):
+    """Unit vectors for the (d) Swap-EPE and (e) Swap-PE component swaps.
+
+    Model constants: they depend only on PE[0]/PE[1], and the layer-0 MLP is
+    position-wise, so a short dummy yields the same first two rows as a full-length input.
+    """
+    device = next(model.parameters()).device
+    dummy = {"input_ids": torch.arange(8, device=device).unsqueeze(0)}
+    pos_enc, _ = get_initial_embeddings_neo(model, dummy)
+    with torch.no_grad():
+        ppes = _epe(model, pos_enc)
+    return {
+        "int_d": (ppes[0] / torch.linalg.norm(ppes[0]),
+                  ppes[1] / torch.linalg.norm(ppes[1])),
+        "int_e": (pos_enc[0][0] / torch.linalg.norm(pos_enc[0][0]),
+                  pos_enc[0][1] / torch.linalg.norm(pos_enc[0][1])),
+    }
+
+
+def make_nnsight_runner_neo(engine, model):
+    """Factory for the NNsight ``run_interventions`` closure (GPT-Neo)."""
+    swap_dirs = neo_swap_directions(model)
+
+    def _make(massive_coords):
+        def _run(inputs):
+            return engine.run_all(inputs, massive_coords=massive_coords,
+                                  swap_dirs=swap_dirs)
+        return _run
+    return _make
+
+
 def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, num_heads, band=None,
-                   massive_coords=None):
-    """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}."""
+                   massive_coords=None, run_interventions=None):
+    """Run all interventions on *sentences*, return {key: (mid_scores, all_scores)}.
+
+    ``run_interventions(inputs) -> {key: [per-layer attn tensors]}`` is the execution
+    engine; it defaults to the manual forward pass. The NNsight engine satisfies the same
+    contract, so everything below this seam is engine-agnostic.
+    """
+    if run_interventions is None:
+        run_interventions = make_manual_runner_neo(model, num_heads, massive_coords)
     ls, le = band if band is not None else (None, None)
     scores_mid = {key: [] for key, *_ in INTERVENTIONS}
     scores_all = {key: [] for key, *_ in INTERVENTIONS}
@@ -680,9 +727,7 @@ def _run_sentences(model, tokenizer, sentences, ds_label, num_layers, num_heads,
         print(f"  [{ds_label} {i + 1}/{n}] {sentence[:80]}...")
         inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
         inputs = inputs.to(model.device)
-        pos_enc, token_embeddings = get_initial_embeddings_neo(model, inputs)
-        results = run_all_interventions(model, token_embeddings, pos_enc, num_heads,
-                                        massive_coords=massive_coords)
+        results = run_interventions(inputs)
         for key, *_ in INTERVENTIONS:
             scores_mid[key].append(
                 compute_bos_attention_metric(results[key], num_layers, "mid",
@@ -701,7 +746,10 @@ def dataset_analysis(model, tokenizer, output_dir, num_heads,
                      band=None,
                      model_name=DEFAULT_MODEL,
                      dtype="float32",
-                     layer_mode="scaled"):
+                     layer_mode="scaled",
+                     engine="manual",
+                     engine_info=None,
+                     make_runner=None):
     """Compute the BOS-attention metric on three standard benchmarks (Table 1).
 
     Datasets: SST-2 (natural language), GSM8K (math), HumanEval (code).  Each is
@@ -723,8 +771,13 @@ def dataset_analysis(model, tokenizer, output_dir, num_heads,
         model, massive_coords, model_name=model_name, dtype=dtype,
         layer_mode=layer_mode, band=band, seed=seed,
         sample_size=sample_size, cut_length=cut_length,
-        harness="intervention_analysis_neo.py")
+        harness="intervention_analysis_neo.py",
+        engine=engine, engine_info=engine_info)
     (output_path / "run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
+
+    # Built here, not by the caller: the engine closure needs the massive-coordinate set
+    # identified just above.
+    run_interventions = make_runner(massive_coords) if make_runner is not None else None
 
     sampled, manifest_rows = sample_benchmark_datasets(
         tokenizer, sample_size=sample_size,
@@ -741,7 +794,8 @@ def dataset_analysis(model, tokenizer, output_dir, num_heads,
         print(f"  Dataset: {ds_name}  ({len(sentences)} examples)")
         print(f"{'═'*60}")
         s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers,
-                                      num_heads, band=band, massive_coords=massive_coords)
+                                      num_heads, band=band, massive_coords=massive_coords,
+                                      run_interventions=run_interventions)
         all_mid[ds_name] = s_mid
         all_scope[ds_name] = s_all
 
@@ -847,19 +901,69 @@ def main():
         default="float32",
         help="Model dtype. Default float32; use a smaller dtype only if VRAM-constrained.",
     )
+    parser.add_argument(
+        "--engine",
+        choices=["manual", "nnsight"],
+        default="manual",
+        help="Execution engine. 'manual' (default) re-implements the forward pass by hand "
+             "and reproduces the published Table-1 numbers. 'nnsight' runs the real "
+             "HuggingFace forward under NNsight, applying every intervention as an "
+             "activation edit and reading attention from the model itself.",
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Execute the NNsight engine remotely on NDIF (requires --engine nnsight).",
+    )
+    parser.add_argument(
+        "--verify-parity",
+        action="store_true",
+        help="Cross-check the NNsight engine against the manual forward pass and write "
+             "parity_report.json. fp32 only.",
+    )
     args = parser.parse_args()
+
+    if args.remote and args.engine != "nnsight":
+        parser.error("--remote requires --engine nnsight")
 
     dtype = {"float32": torch.float32, "float16": torch.float16,
              "bfloat16": torch.bfloat16}[args.dtype]
-    model, tokenizer = load_neo(args.model_name, dtype=dtype)
+
+    engine_info = None
+    nn_engine = None
+    if args.engine == "nnsight" or args.verify_parity:
+        from nnsight_engine import ARCH_SPECS, NNsightEngine, load_nnsight_model
+        spec = ARCH_SPECS["neo"]
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        lm = load_nnsight_model(spec, args.model_name, dtype=dtype, tokenizer=tokenizer,
+                                remote=args.remote)
+        model = lm._model
+        nn_engine = NNsightEngine(lm, spec, remote=args.remote)
+        engine_info = nn_engine.engine_info() if args.engine == "nnsight" else None
+    else:
+        model, tokenizer = load_neo(args.model_name, dtype=dtype)
+
     num_heads = getattr(model.config, "num_heads", None) or model.config.num_attention_heads
     num_layers = len(model.transformer.h)
     band = compute_band(num_layers, args.layer_mode)
     print(f"Layers: {num_layers}; mid-band [{band[0]}, {band[1]}) (layer-mode {args.layer_mode}).\n")
 
+    if args.verify_parity:
+        from nnsight_engine import run_parity_check
+        run_parity_check(
+            nn_engine, model, tokenizer, band, num_layers,
+            manual_runner_factory=lambda mc: make_manual_runner_neo(model, num_heads, mc),
+            swap_dirs=neo_swap_directions(model),
+            massive_coords=identify_massive_coords_neo(model),
+            dtype=args.dtype, output_dir=args.output_dir,
+        )
+        return
+
     if args.mode == "sentence":
         sentence_analysis(model, tokenizer, args.sentence, args.output_dir, num_heads)
     else:
+        make_runner = (make_nnsight_runner_neo(nn_engine, model)
+                       if args.engine == "nnsight" else None)
         dataset_analysis(
             model, tokenizer, args.output_dir, num_heads,
             sample_size=args.sample_size,
@@ -869,6 +973,9 @@ def main():
             model_name=args.model_name,
             dtype=args.dtype,
             layer_mode=args.layer_mode,
+            engine=args.engine,
+            engine_info=engine_info,
+            make_runner=make_runner,
         )
 
 
