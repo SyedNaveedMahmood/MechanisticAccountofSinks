@@ -11,3 +11,7 @@ datasets==4.8.4
 # E3 (emergence dynamics): checkpoint discovery + per-revision cache management.
 # Floor rather than exact pin so it stays compatible with whatever transformers==5.3.0 resolves.
 huggingface_hub>=0.34.0
+# E1/E2 `--engine nnsight`: run the real HF forward and apply the interventions as
+# activation edits inside .trace(). Additive — it leaves the torch/transformers pins above
+# untouched. The default `--engine manual` path does not import it.
+nnsight==0.7.0

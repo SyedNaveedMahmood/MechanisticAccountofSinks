@@ -138,6 +138,40 @@ each model instead of assuming GPT-2 small's fixed top three. The random control
 same number of coordinates, and each dataset run records the selected coordinates and model
 geometry in `run_config.json`.
 
+#### Execution engines (`--engine`)
+
+Every command in this section accepts `--engine {manual,nnsight}`.
+
+| | |
+|---|---|
+| `manual` (default) | Re-implements the transformer forward pass by hand, reading raw weight tensors off the modules. This is what produced the numbers in [`docs/E1-E2_Summary.md`](docs/E1-E2_Summary.md); leave it alone to reproduce them. |
+| `nnsight` | Runs the **real** HuggingFace forward under [NNsight](https://nnsight.net/), applying all ten interventions as activation edits inside `.trace()` and reading attention probabilities from the model itself. |
+
+Under `--engine nnsight` the model's own attention, RoPE and GQA are used instead of
+re-implementations, and each run records the engine plus the `nnsight`/`transformers`/
+`torch` versions in `run_config.json`. NNsight runs write to a separate
+`..._nnsight` directory, so the two engines never overwrite each other.
+
+`--verify-parity` cross-checks the two engines per intervention and writes
+`parity_report.json`. On real weights (fp32) the BOS metric agrees to ~1e-7:
+
+```bash
+python ../common/intervention_analysis.py     --model-name gpt2                    --verify-parity
+python opt/intervention_analysis_opt.py       --model-name facebook/opt-125m       --verify-parity
+python neo/intervention_analysis_neo.py       --model-name EleutherAI/gpt-neo-125m --verify-parity
+python qwen/intervention_analysis_qwen.py     --model-name Qwen/Qwen2.5-0.5B       --verify-parity
+```
+
+Parity gates on the **BOS metric** (the number that reaches the CSV), not on raw
+attention probabilities, and only in fp32 — in fp16/bf16 the two paths are genuinely
+different algorithms (HF upcasts q/k and/or softmax to fp32; the manual path does not),
+so the gate downgrades to advisory. See [`docs/E1.md`](docs/E1.md) §7 for what parity
+found.
+
+`--remote` runs the NNsight engine on [NDIF](https://ndif.us/) instead of locally. It
+needs an NDIF API key and only works for checkpoints NDIF hosts — **none of the 16 models
+below are currently hosted**, so this is an escape hatch, not a reproduction path.
+
 ### GPT-2 (`--architecture gpt2`)
 
 ```bash
