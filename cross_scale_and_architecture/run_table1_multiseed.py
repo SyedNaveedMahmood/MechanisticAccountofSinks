@@ -36,6 +36,17 @@ import pandas as pd
 
 DEFAULT_SEEDS = [0, 1, 2]
 
+# The harness scripts below are named relative to this file, and are resolved against
+# _DRIVER_DIR before use. Seeds run from _REPO_ROOT rather than inheriting the caller's
+# cwd, because HuggingFace resolves a bare model id as a *local directory* when one
+# exists: running from cross_scale_and_architecture/ (which the README instructs) made
+# `--model gpt2` pick up the documentation stub in ./gpt2/ and fail with
+# "no file named model.safetensors ... found in directory gpt2". The repo root has no
+# such shadowing directory. Only bare ids collide; `gpt2-medium`, `facebook/opt-125m`
+# and friends were never affected.
+_DRIVER_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _DRIVER_DIR.parent
+
 # Per-architecture harness script and the dataset-analysis subdirectory it writes.
 ARCHITECTURES = {
     "gpt2": {
@@ -87,14 +98,14 @@ def safe_model_tag(model_name: str) -> str:
 
 
 def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
-    script = ARCHITECTURES[args.architecture]["script"]
+    script = str((_DRIVER_DIR / ARCHITECTURES[args.architecture]["script"]).resolve())
     cmd = [
         args.python,
         script,
         "--mode",
         "dataset",
         "--output-dir",
-        str(out_dir),
+        str(Path(out_dir).resolve()),
         "--seed",
         str(seed),
         "--model-name",
@@ -110,11 +121,19 @@ def run_seed(args: argparse.Namespace, seed: int, out_dir: Path) -> None:
     if args.dtype is not None:
         # 'auto' is only supported by the Qwen harness; other harnesses take an explicit dtype.
         cmd.extend(["--dtype", args.dtype])
+    # All four harnesses accept --engine; 'manual' is each harness's own default and is
+    # what reproduces docs/E1-E2_Summary.md, so an unset flag forwards nothing.
+    if args.engine is not None:
+        cmd.extend(["--engine", args.engine])
+    if args.remote:
+        cmd.append("--remote")
 
     print("\n" + "=" * 80)
     print(f"Seed {seed}: {' '.join(cmd)}")
     print("=" * 80)
-    subprocess.run(cmd, check=True)
+    # cwd=_REPO_ROOT: see the note beside ARCHITECTURES — a bare `--model gpt2` would
+    # otherwise be shadowed by the ./gpt2 documentation stub.
+    subprocess.run(cmd, check=True, cwd=_REPO_ROOT)
 
 
 def read_seed_results(root: Path, seed: int, dataset_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -330,6 +349,20 @@ def main() -> None:
              "models). Use 'fixed' to force layers 4-11 on every size.",
     )
     parser.add_argument(
+        "--engine",
+        choices=["manual", "nnsight"],
+        default=None,
+        help="Execution engine, forwarded to every harness (default: harness default "
+             "'manual', which re-implements the forward pass by hand and reproduces the "
+             "published Table-1 numbers). 'nnsight' runs the real HuggingFace forward under "
+             "NNsight and reads attention from the model itself.",
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Execute the NNsight engine remotely on NDIF (requires --engine nnsight).",
+    )
+    parser.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip a seed when its overall CSV already exists.",
@@ -340,6 +373,16 @@ def main() -> None:
         help="Do not run experiments; only aggregate and plot existing seed outputs.",
     )
     args = parser.parse_args()
+
+    if args.remote and args.engine != "nnsight":
+        parser.error("--remote requires --engine nnsight")
+
+    # Seeds run from _REPO_ROOT, so a caller-relative --python (e.g. ../.venv/Scripts/
+    # python.exe) must be resolved against the *caller's* cwd first. The default is
+    # sys.executable, which is already absolute.
+    _py = Path(args.python)
+    if _py.exists():
+        args.python = str(_py.resolve())
 
     architecture = ARCHITECTURES[args.architecture]
     dataset_dir = architecture["dataset_dir"]
@@ -352,6 +395,11 @@ def main() -> None:
             parts.append(args.architecture)
         if args.model_name != "gpt2":
             parts.append(safe_model_tag(args.model_name))
+        # Tag the engine so an NNsight run cannot silently overwrite the manual results
+        # directory (which would also break the md5-distinctness audit in
+        # docs/E1-E2_Summary.md). Default naming is unchanged when --engine is unset.
+        if args.engine == "nnsight":
+            parts.append("nnsight")
         args.experiment_name = "_".join(parts)
 
     root = args.output_dir / args.experiment_name
