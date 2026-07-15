@@ -200,7 +200,7 @@ def load_qwen(model_name, dtype="float32"):
         f"Model loaded — {cfg.num_hidden_layers} layers, "
         f"{cfg.num_attention_heads} query heads / {cfg.num_key_value_heads} kv heads, "
         f"hidden {cfg.hidden_size}, head_dim {head_dim}, "
-        f"rope_theta {getattr(cfg, 'rope_theta', 10000.0)}."
+        f"rope_theta {resolve_rope_theta(cfg)}."
     )
     print(f"Using device: {device} (dtype {torch_dtype}).\n")
     return model, tokenizer
@@ -581,15 +581,55 @@ INTERVENTIONS = [
 # Shared helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def resolve_rope_theta(cfg):
+    """RoPE base frequency, across the transformers 4.x / 5.x config layouts.
+
+    transformers 5.x moved this into ``config.rope_parameters["rope_theta"]``; 4.x exposed
+    it as ``config.rope_theta``. Reading it with a plain ``getattr(cfg, "rope_theta",
+    10000.0)`` therefore *silently* returns the 10000.0 default under 5.x, where Qwen2.5's
+    true value is 1e6 — every rotation frequency in the manual path would be wrong, and the
+    failure is invisible because the fallback looks like an ordinary default.
+
+    Raises rather than guessing if neither layout is present: a wrong theta is far worse
+    than a loud failure.
+    """
+    params = getattr(cfg, "rope_parameters", None)
+    if isinstance(params, dict) and "rope_theta" in params:
+        return float(params["rope_theta"])
+    theta = getattr(cfg, "rope_theta", None)          # transformers 4.x
+    if theta is not None:
+        return float(theta)
+    raise ValueError(
+        "Could not resolve rope_theta from the model config (checked "
+        "config.rope_parameters['rope_theta'] and config.rope_theta). Refusing to fall "
+        "back to a default, which would silently produce wrong rotation frequencies."
+    )
+
+
+def _rope_type(cfg):
+    params = getattr(cfg, "rope_parameters", None)
+    if isinstance(params, dict):
+        return params.get("rope_type", "default")
+    return getattr(cfg, "rope_scaling", None) or "default"
+
+
 def _model_geometry(model):
     """Collect the head/RoPE geometry the intervention loop needs from the config."""
     cfg = model.config
     head_dim = getattr(cfg, "head_dim", None) or (cfg.hidden_size // cfg.num_attention_heads)
+    rope_type = _rope_type(cfg)
+    if rope_type not in ("default", None):
+        # The manual RoPE implements the plain formulation only: it applies neither
+        # `attention_scaling` nor any frequency remapping (yarn/linear/dynamic).
+        raise ValueError(
+            f"This harness's manual RoPE supports rope_type='default' only, got "
+            f"{rope_type!r}. Run with --engine nnsight, which uses the model's own RoPE."
+        )
     return {
         "num_heads": cfg.num_attention_heads,
         "num_kv_heads": cfg.num_key_value_heads,
         "head_dim": head_dim,
-        "rope_theta": float(getattr(cfg, "rope_theta", 10000.0)),
+        "rope_theta": resolve_rope_theta(cfg),
     }
 
 
