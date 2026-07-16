@@ -25,8 +25,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import argparse
+import json
 from pathlib import Path
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import transformers
 
 # Shared analysis modules live in the repository's top-level ``common/`` folder
 # (one master copy each). Make them importable regardless of the launch directory.
@@ -53,6 +55,102 @@ from experiments_single_input import (
     LAYER_RANGE_START,  # 0-indexed inclusive  (paper layer 4)
     LAYER_RANGE_END,    # 0-indexed exclusive  (paper layer 11)
 )
+from nnsight_engine import (
+    ARCH_SPECS,
+    GPT2TracePlan,
+    GPT2_TRACE_REGISTRY_VERSION,
+    NNsightEngine,
+    load_nnsight_model,
+)
+
+
+REPRO_FORWARD_REGISTRY_VERSION = "reproduction-forward-v1"
+
+
+def _trace_bias_scores(model, nn_engine, inputs):
+    """Per-head bq·k values from the actual traced pre-LN/QK projections."""
+    num_layers = len(model.transformer.h)
+    hidden = model.config.n_embd
+    heads = model.config.n_head
+    head_dim = hidden // heads
+    traced = nn_engine.run_gpt2_trace(
+        GPT2TracePlan("repro_bias_baseline"),
+        {"input_ids": inputs["input_ids"],
+         "attention_mask": inputs.get("attention_mask", torch.ones_like(inputs["input_ids"]))},
+        band=(0, num_layers), attention="none", capture_qk=True,
+        capture_pre_ln=False)
+    rows = []
+    for li, projected in enumerate(traced["qk"]):
+        bias = model.transformer.h[li].attn.c_attn.bias.detach().float().cpu()
+        bq, bk, _ = bias.chunk(3, dim=0)
+        key_content = projected[:, hidden:2 * hidden] - bk
+        values = torch.einsum(
+            "hd,shd->hs", bq.view(heads, head_dim),
+            key_content.view(key_content.shape[0], heads, head_dim))
+        rows.append(values.numpy())
+    return rows
+
+
+@torch.no_grad()
+def _direct_embeddings(model, input_ids):
+    positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+    return model.transformer.wpe(positions), model.transformer.wte(input_ids)
+
+
+def _traced_full_first_layer_similarities(model, nn_engine, inputs, token_embeddings, pos_enc):
+    baseline = nn_engine.run_gpt2_trace(
+        GPT2TracePlan("epe_validation_R"), inputs, band=(0, 1), attention="none",
+        capture_block_outputs=(0,))
+    token_only = nn_engine.run_gpt2_trace(
+        GPT2TracePlan("epe_validation_O", position_edit="zero_all"), inputs,
+        band=(0, 1), attention="none", capture_block_outputs=(0,))
+    with torch.no_grad():
+        epe = pos_enc + model.transformer.h[0].mlp(pos_enc)
+        difference = baseline["block_outputs"][0] - token_only["block_outputs"][0]
+        similarities = torch.nn.functional.cosine_similarity(
+            epe[0].detach().float().cpu(), difference.float().cpu(), dim=-1)
+    return [float(value) for value in similarities]
+
+
+def _write_engine_config(output_path, *, engine, model, model_name, revision,
+                         dtype, nn_engine=None, measurement=None):
+    if engine == "nnsight":
+        info = nn_engine.engine_info(
+            model_name=model_name, revision=revision, dtype=dtype,
+            device=next(model.parameters()).device,
+            band=(0, len(model.transformer.h)),
+            registry_version=REPRO_FORWARD_REGISTRY_VERSION)
+    elif engine == "manual":
+        info = {
+            "name": "manual", "nnsight_version": None,
+            "transformers_version": transformers.__version__,
+            "torch_version": torch.__version__, "model_name": model_name,
+            "model_revision": revision or "main", "dtype": dtype,
+            "device": str(next(model.parameters()).device), "remote": False,
+            "execution_location": "local",
+            "attn_implementation": "manual_reimplementation",
+            "attention_probability_source": None,
+            "intervention_registry_version": REPRO_FORWARD_REGISTRY_VERSION,
+        }
+    else:
+        info = {
+            "name": "weight_space", "requested_engine": engine,
+            "nnsight_version": None,
+            "transformers_version": transformers.__version__,
+            "torch_version": torch.__version__, "model_name": model_name,
+            "model_revision": revision or "main", "dtype": dtype,
+            "device": str(next(model.parameters()).device), "remote": False,
+            "execution_location": "local", "attn_implementation": "not_applicable",
+            "attention_probability_source": "not_applicable",
+            "intervention_registry_version": REPRO_FORWARD_REGISTRY_VERSION,
+        }
+    (output_path / "run_config.json").write_text(json.dumps({
+        "engine_name": engine,
+        "engine": info,
+        "measurement": measurement,
+        "registry_version": REPRO_FORWARD_REGISTRY_VERSION,
+        "trace_registry_version": GPT2_TRACE_REGISTRY_VERSION,
+    }, indent=2, sort_keys=True), encoding="utf-8")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -62,9 +160,14 @@ from experiments_single_input import (
 def run_analysis(model, tokenizer, output_dir,
                  sample_size=DEFAULT_SAMPLE_SIZE,
                  cut_length=DEFAULT_CUT_LENGTH,
-                 seed=DEFAULT_SEED):
+                 seed=DEFAULT_SEED, engine="manual", nn_engine=None,
+                 model_name="gpt2", revision=None, dtype="float32"):
     output_path = Path(output_dir) / "bias_term_statistical"
     output_path.mkdir(parents=True, exist_ok=True)
+    _write_engine_config(
+        output_path, engine=engine, model=model, model_name=model_name,
+        revision=revision, dtype=dtype, nn_engine=nn_engine,
+        measurement="forward-dependent bq dot actual content-key projection")
 
     num_layers = len(model.transformer.h)
     num_heads = model.config.n_head
@@ -90,15 +193,17 @@ def run_analysis(model, tokenizer, output_dir,
 
     for idx, sentence in enumerate(all_sentences):
         if (idx + 1) % 25 == 0 or idx == 0:
-            print(f"  [{idx + 1}/{n_sentences}] processing…")
+            print(f"  [{idx + 1}/{n_sentences}] processing...")
         inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
         inputs = inputs.to(model.device)
-        pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
-
-        with torch.no_grad():
-            bq_k, _bq_ppe = collect_similarities_for_sentence(
-                model, token_embeddings, pos_enc
-            )
+        if engine == "nnsight":
+            bq_k = _trace_bias_scores(model, nn_engine, inputs)
+        else:
+            pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
+            with torch.no_grad():
+                bq_k, _bq_ppe = collect_similarities_for_sentence(
+                    model, token_embeddings, pos_enc
+                )
 
         for layer_idx in range(num_layers):
             # bq_k[layer_idx] is np.ndarray of shape [num_heads, seq_len]
@@ -109,7 +214,7 @@ def run_analysis(model, tokenizer, output_dir,
     # which leaves softmax attention weights unchanged.
     bq_k_data -= bq_k_data.min(axis=3, keepdims=True)
 
-    print("\nComputing percentiles…")
+    print("\nComputing percentiles...")
 
     percentiles = [10, 50, 90]
 
@@ -302,9 +407,9 @@ def _print_percentile_table(label, data, cut_length):
     p50 = np.percentile(data, 50, axis=0)
     p90 = np.percentile(data, 90, axis=0)
 
-    print(f"\n{'─'*60}")
+    print(f"\n{'-'*60}")
     print(f"  {label}")
-    print(f"{'─'*60}")
+    print(f"{'-'*60}")
     print(f"  {'pos':>4s}   {'p10':>8s}   {'p50':>8s}   {'p90':>8s}")
     for pos in range(cut_length):
         print(f"  {pos:>4d}   {p10[pos]:>8.4f}   {p50[pos]:>8.4f}   {p90[pos]:>8.4f}")
@@ -316,7 +421,8 @@ def _print_percentile_table(label, data, cut_length):
 def epe_validation_analysis(model, tokenizer, output_dir,
                             sample_size=DEFAULT_SAMPLE_SIZE,
                             cut_length=DEFAULT_CUT_LENGTH,
-                            seed=DEFAULT_SEED):
+                            seed=DEFAULT_SEED, engine="manual", nn_engine=None,
+                            model_name="gpt2", revision=None, dtype="float32"):
     """Compute cos(EPE_i, R_i - O_i) across benchmark datasets and report
     percentiles per token position.
 
@@ -326,6 +432,10 @@ def epe_validation_analysis(model, tokenizer, output_dir,
     """
     output_path = Path(output_dir) / "epe_validation_statistical"
     output_path.mkdir(parents=True, exist_ok=True)
+    _write_engine_config(
+        output_path, engine=engine, model=model, model_name=model_name,
+        revision=revision, dtype=dtype, nn_engine=nn_engine,
+        measurement="MLP weight utility plus actual first-block R/O forward")
 
     sampled, manifest_rows = sample_benchmark_datasets(
         tokenizer, sample_size=sample_size,
@@ -344,16 +454,23 @@ def epe_validation_analysis(model, tokenizer, output_dir,
 
     for idx, sentence in enumerate(all_sentences):
         if (idx + 1) % 25 == 0 or idx == 0:
-            print(f"  [{idx + 1}/{n_sentences}] processing…")
+            print(f"  [{idx + 1}/{n_sentences}] processing...")
         inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
         inputs = inputs.to(model.device)
-        pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
+        if engine == "nnsight":
+            pos_enc, token_embeddings = _direct_embeddings(model, inputs["input_ids"])
+        else:
+            pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
 
         with torch.no_grad():
             sims_mlp = compute_epe_similarities(model, token_embeddings, pos_enc)
-            sims_full = compute_epe_full_first_layer_similarities(
-                model, token_embeddings, pos_enc
-            )
+            if engine != "nnsight":
+                sims_full = compute_epe_full_first_layer_similarities(
+                    model, token_embeddings, pos_enc
+                )
+        if engine == "nnsight":
+            sims_full = _traced_full_first_layer_similarities(
+                model, nn_engine, inputs, token_embeddings, pos_enc)
 
         data_mlp[idx, :len(sims_mlp)] = sims_mlp
         data_full[idx, :len(sims_full)] = sims_full
@@ -441,7 +558,8 @@ def epe_validation_analysis(model, tokenizer, output_dir,
 # Coordinate-level γ alignment analysis (weight-only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def coord_alignment_analysis(model, output_dir):
+def coord_alignment_analysis(model, output_dir, *, requested_engine="manual",
+                             model_name="gpt2", revision=None, dtype="float32"):
     """Per-head dual histogram of |γ_h^(l)[d]| at massive vs other coordinates.
 
     γ_h^(l)[d] = |bq_h^(l) · Wk_h^(l)[:,d]|  — the contribution of coordinate d
@@ -455,6 +573,10 @@ def coord_alignment_analysis(model, output_dir):
     """
     output_path = Path(output_dir) / "coord_alignment_statistical"
     output_path.mkdir(parents=True, exist_ok=True)
+    _write_engine_config(
+        output_path, engine="weight_space", model=model, model_name=model_name,
+        revision=revision, dtype=dtype,
+        measurement=f"pure weight-space gamma alignment (requested engine: {requested_engine})")
 
     num_layers = len(model.transformer.h)
     num_heads  = model.config.n_head
@@ -512,7 +634,7 @@ def coord_alignment_analysis(model, output_dir):
 
     print(f"Collected {len(massive_vals)} massive-coord values "
           f"and {len(other_vals)} other-coord values "
-          f"across layers {layer_start+1}–{layer_end} (1-indexed), {num_heads} heads.\n")
+          f"across layers {layer_start+1}-{layer_end} (1-indexed), {num_heads} heads.\n")
 
     # ── Dual density histogram ────────────────────────────────────────────────
     all_vals = np.concatenate([massive_vals, other_vals])
@@ -613,14 +735,44 @@ def main():
         "--seed", type=int, default=DEFAULT_SEED,
         help="Random seed for dataset sampling.",
     )
+    parser.add_argument("--model-name", default="gpt2",
+                        help="Hugging Face GPT-2-compatible model or local path.")
+    parser.add_argument("--revision", default=None,
+                        help="Optional Hugging Face model revision (default: main).")
+    parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"],
+                        default="float32")
+    parser.add_argument("--engine", choices=["manual", "nnsight"], default="manual",
+                        help="Forward execution engine for bias-term/epe-validation. "
+                             "coord-alignment is pure weight-space under either choice.")
     args = parser.parse_args()
 
-    print("Loading GPT-2…")
+    print("Loading GPT-2...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GPT2LMHeadModel.from_pretrained("gpt2", attn_implementation="eager")
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    model.to(device)
-    model.eval()
+    dtype = {"float32": torch.float32, "float16": torch.float16,
+             "bfloat16": torch.bfloat16}[args.dtype]
+    tokenizer = None
+    nn_engine = None
+    if args.mode != "coord-alignment" and args.engine == "nnsight":
+        tokenizer = GPT2Tokenizer.from_pretrained(args.model_name, revision=args.revision)
+        try:
+            lm = load_nnsight_model(
+                ARCH_SPECS["gpt2"], args.model_name, dtype=dtype, tokenizer=tokenizer,
+                device=device, revision=args.revision)
+            model = lm._model
+            nn_engine = NNsightEngine(lm, ARCH_SPECS["gpt2"])
+        except Exception as exc:
+            raise RuntimeError(
+                f"NNsight initialization failed for reproduction mode {args.mode!r}; "
+                f"the manual implementation was not run: {exc}") from exc
+    else:
+        model = GPT2LMHeadModel.from_pretrained(
+            args.model_name, revision=args.revision, attn_implementation="eager")
+        model.to(device)
+        model.to(dtype)
+        model.eval()
+        if args.mode != "coord-alignment":
+            tokenizer = GPT2Tokenizer.from_pretrained(
+                args.model_name, revision=args.revision)
     print(f"Model loaded on {device}.\n")
 
     if args.mode == "bias-term":
@@ -629,6 +781,8 @@ def main():
             sample_size=args.sample_size,
             cut_length=args.cut_length,
             seed=args.seed,
+            engine=args.engine, nn_engine=nn_engine,
+            model_name=args.model_name, revision=args.revision, dtype=args.dtype,
         )
     elif args.mode == "epe-validation":
         epe_validation_analysis(
@@ -636,9 +790,13 @@ def main():
             sample_size=args.sample_size,
             cut_length=args.cut_length,
             seed=args.seed,
+            engine=args.engine, nn_engine=nn_engine,
+            model_name=args.model_name, revision=args.revision, dtype=args.dtype,
         )
     elif args.mode == "coord-alignment":
-        coord_alignment_analysis(model, args.output_dir)
+        coord_alignment_analysis(
+            model, args.output_dir, requested_engine=args.engine,
+            model_name=args.model_name, revision=args.revision, dtype=args.dtype)
 
 
 if __name__ == "__main__":

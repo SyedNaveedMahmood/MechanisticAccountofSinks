@@ -57,7 +57,7 @@ NNsight 0.7 constraints this module is built around
 import functools
 import random
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -181,6 +181,52 @@ class EditPlan:
     wk_zero: Optional[str] = None       # "massive" | "random"
 
 
+# Versioned separately from the Table-1 registry because E3/E4/E5 consume a wider,
+# graded intervention vocabulary.  Persist this value in every run configuration so a
+# cache produced before an edit-semantics change cannot be silently reused afterward.
+GPT2_TRACE_REGISTRY_VERSION = "gpt2-nnsight-trace-v1"
+
+
+@dataclass(frozen=True)
+class GPT2TracePlan:
+    """Declarative GPT-2 intervention consumed by the shared traced-forward executor.
+
+    This is deliberately a small *execution* vocabulary rather than a second scientific
+    registry.  E4 maps its named configurations to this object and E5 maps its existing
+    :class:`InterventionSpec` source of truth to it.  The same plan can request attention,
+    activation, projection, or logit captures without changing intervention semantics.
+
+    ``position_edit`` is one of ``remove_first``, ``zero_first``, ``zero_all``,
+    ``scale_first`` or ``interp_first``.  ``mlp_edit`` is one of ``swap_epe``,
+    ``swap_pe``, ``zero_first`` or ``zero_all``.  ``wk_scale=0`` exactly implements a
+    Wk-column ablation; values between/above zero implement the E4/E5 dose response.
+    """
+
+    key: str
+    token_edit: Optional[str] = None
+    position_edit: Optional[str] = None
+    position_alpha: float = 1.0
+    query_bias_scale: float = 1.0
+    mlp_edit: Optional[str] = None
+    wk_coords: Tuple[int, ...] = field(default_factory=tuple)
+    wk_scale: float = 1.0
+
+    def validate(self, seq_len: Optional[int] = None) -> None:
+        if self.token_edit not in (None, "zero_first"):
+            raise ValueError(f"Unsupported token edit: {self.token_edit!r}")
+        if self.position_edit not in (
+                None, "remove_first", "zero_first", "zero_all",
+                "scale_first", "interp_first"):
+            raise ValueError(f"Unsupported position edit: {self.position_edit!r}")
+        if self.mlp_edit not in (None, "swap_epe", "swap_pe", "zero_first", "zero_all"):
+            raise ValueError(f"Unsupported MLP edit: {self.mlp_edit!r}")
+        if seq_len is not None and seq_len < 2 and self.position_edit in (
+                "remove_first", "interp_first"):
+            raise ValueError(f"{self.position_edit} requires at least two tokens")
+        if seq_len is not None and seq_len < 2 and self.mlp_edit in ("swap_epe", "swap_pe"):
+            raise ValueError(f"{self.mlp_edit} requires at least two tokens")
+
+
 def build_edit_plans(spec: ArchSpec) -> Dict[str, EditPlan]:
     """Per-architecture intervention table, keyed exactly like each harness's registry.
 
@@ -262,7 +308,10 @@ def _resolve(root: Any, path: str) -> Any:
 
 
 def load_nnsight_model(spec: ArchSpec, model_name: str, *, dtype, tokenizer,
-                       device=None, remote: bool = False, guard: Optional[Callable] = None):
+                       device=None, remote: bool = False, guard: Optional[Callable] = None,
+                       revision: Optional[str] = None, cache_dir: Optional[str] = None,
+                       local_files_only: bool = False, prefer_bin: bool = False,
+                       model_kwargs: Optional[dict] = None):
     """Wrap ``model_name`` in an NNsight ``LanguageModel``, preserving harness semantics.
 
     ``guard(hf_model, model_name)`` is the harness's own structural check (e.g. OPT's
@@ -279,11 +328,43 @@ def load_nnsight_model(spec: ArchSpec, model_name: str, *, dtype, tokenizer,
     """
     from nnsight import LanguageModel
 
-    kwargs = {"attn_implementation": "eager"}
+    # Eager attention is part of the engine contract, not a caller-tunable model option:
+    # the traced probability surface does not exist under SDPA/Flash implementations.
+    kwargs = {**(model_kwargs or {}), "attn_implementation": "eager"}
     if spec.dtype_mode == "from_pretrained":
         kwargs["torch_dtype"] = dtype
+    if revision is not None:
+        kwargs["revision"] = revision
+    if cache_dir is not None:
+        kwargs["cache_dir"] = cache_dir
+    if local_files_only:
+        kwargs["local_files_only"] = True
 
-    lm = LanguageModel(model_name, tokenizer=tokenizer, dispatch=not remote, **kwargs)
+    # Stanford-CRFM's historical GPT-2 checkpoints are commonly .bin-only.  Asking for
+    # safetensors first can start transformers' background conversion helper, so E3 requests
+    # ``prefer_bin=True``.  Retrying the alternate *serialization format* remains entirely
+    # within NNsight; it is not an execution-engine fallback.
+    attempts = [False, True] if prefer_bin and "use_safetensors" not in kwargs else [None]
+    first_error = None
+    lm = None
+    for use_safetensors in attempts:
+        attempt_kwargs = dict(kwargs)
+        if use_safetensors is not None:
+            attempt_kwargs["use_safetensors"] = use_safetensors
+        try:
+            lm = LanguageModel(
+                model_name, tokenizer=tokenizer, dispatch=not remote, **attempt_kwargs)
+            break
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            if use_safetensors is True or len(attempts) == 1:
+                detail = f"; first serialization error: {first_error}" if first_error is not exc else ""
+                raise RuntimeError(
+                    f"Failed to initialize NNsight for {model_name!r} at revision "
+                    f"{revision or 'main'!r}{detail}: {exc}") from exc
+    if lm is None:  # defensive; the loop either assigns or raises
+        raise RuntimeError(f"Failed to initialize NNsight for {model_name!r}")
 
     if guard is not None:
         guard(lm._model, model_name)
@@ -552,18 +633,252 @@ class NNsightEngine:
             )
         return results
 
-    def engine_info(self) -> dict:
-        """Provenance fields for ``run_config.json``."""
+    def run_gpt2_trace(self, plan: GPT2TracePlan, inputs, *,
+                       band: Optional[Tuple[int, int]] = None,
+                       attention: str = "full",
+                       target_positions: Sequence[int] = (0,),
+                       capture_qk: bool = False,
+                       capture_pre_ln: Optional[bool] = None,
+                       capture_qk_position0_only: bool = False,
+                       capture_block_outputs: Sequence[int] = (),
+                       capture_logits: bool = False,
+                       capture_token_ce: bool = False,
+                       swap_dirs: Optional[tuple] = None) -> dict:
+        """Execute one declarative GPT-2 plan through the real Hugging Face forward.
+
+        ``attention`` controls what leaves the trace:
+
+        * ``full`` saves selected-layer ``[heads, query, key]`` maps (parity only);
+        * ``metrics`` saves compact sufficient statistics for the complete E5 metric
+          battery, never retaining the selected layer band's full maps;
+        * ``targets`` saves per-head second-half attention to ``target_positions``;
+        * ``none`` saves no attention data.
+
+        Q/K capture saves only the query/key portion of the selected-layer fused projection.
+        ``capture_pre_ln`` defaults to the same value for backward compatibility with E4's
+        identity check, but callers needing only projected Q/K can disable it.
+        ``capture_qk_position0_only`` is the E5 length-invariance path and retains one
+        position rather than every token. Values are detached and copied to CPU immediately after the
+        trace. ``capture_token_ce`` derives next-token losses from the actual LM-head logits
+        inside the trace and saves only ``[sequence-1]`` values, avoiding a retained
+        ``sequence x vocabulary`` tensor on E5's long-context path. This method intentionally
+        does not use an outer ``torch.no_grad`` for the same NNsight deferred-execution reason
+        documented in :meth:`run_all`.
+        """
+        if self.spec.name != "gpt2" or self.spec.qkv_layout != "fused":
+            raise TypeError("run_gpt2_trace currently supports GPT-2-compatible fused QKV models only")
+        if attention not in {"full", "metrics", "targets", "none"}:
+            raise ValueError(f"Unknown attention capture mode: {attention!r}")
+
+        ids = inputs["input_ids"] if hasattr(inputs, "__getitem__") else inputs
+        seq_len = int(ids.shape[-1])
+        plan.validate(seq_len)
+        if capture_token_ce and seq_len < 2:
+            raise ValueError("Token cross-entropy requires at least two tokens")
+        if capture_pre_ln is None:
+            capture_pre_ln = capture_qk
+        ls, le = band if band is not None else (0, self.num_layers)
+        if not (0 <= ls < le <= self.num_layers):
+            raise ValueError(f"Invalid layer band [{ls}, {le}) for {self.num_layers} layers")
+        selected = set(range(ls, le))
+        targets = tuple(int(p) for p in target_positions)
+        if any(p < 0 or p >= seq_len for p in targets):
+            raise ValueError(f"Target positions {targets!r} are invalid for length {seq_len}")
+        blocks_to_capture = set(int(i) for i in capture_block_outputs)
+        if any(i < 0 or i >= self.num_layers for i in blocks_to_capture):
+            raise ValueError(f"Invalid block capture indices: {sorted(blocks_to_capture)}")
+        if plan.mlp_edit in {"swap_epe", "swap_pe"} and swap_dirs is None:
+            raise ValueError(f"{plan.mlp_edit} requires precomputed swap directions")
+
+        payload = self._payload(EditPlan(key=plan.key), inputs)
+        H = self.hidden
+        q_bias = None
+        if plan.query_bias_scale != 1.0:
+            q_bias = [self._q_bias(i) for i in range(self.num_layers)]
+        wk_ops = None
+        if plan.wk_coords and plan.wk_scale != 1.0:
+            wk_ops = [self._wk_correction(i, plan.wk_coords)
+                      for i in range(self.num_layers)]
+
+        saved_attention: List[Any] = []
+        saved_targets: Dict[int, List[Any]] = {p: [] for p in targets}
+        saved_metrics: List[dict] = []
+        saved_pre_ln: List[Any] = []
+        saved_qk: List[Any] = []
+        saved_blocks: Dict[int, Any] = {}
+        saved_logits = None
+        saved_token_ce = None
+        second_half = seq_len // 2
+        # Normalize entropy only after the compact query summaries have been detached to
+        # CPU.  ``input_ids`` can remain on CPU while a dispatched model executes on a
+        # CUDA device, so carrying this eager tensor into the trace would create a
+        # cross-device division even though the saved result is only O(sequence length).
+        entropy_normalizer = torch.log(
+            torch.arange(second_half + 1, seq_len + 1,
+                         dtype=torch.float32)).clamp_min(1e-12)
+
+        with self.lm.trace(payload, remote=self.remote):
+            # Embedding edits happen before every decoder block.
+            if plan.token_edit == "zero_first":
+                _resolve(self.lm, self.spec.wte_path).output[0, 0] = 0
+            if plan.position_edit is not None:
+                wpe = _resolve(self.lm, self.spec.wpe_path)
+                if plan.position_edit == "remove_first":
+                    wpe.output[0, 0] = wpe.output[0, 1]
+                elif plan.position_edit == "zero_first":
+                    wpe.output[0, 0] = 0
+                elif plan.position_edit == "zero_all":
+                    wpe.output[:] = 0
+                elif plan.position_edit == "scale_first":
+                    wpe.output[0, 0] = plan.position_alpha * wpe.output[0, 0]
+                elif plan.position_edit == "interp_first":
+                    wpe.output[0, 0] = (
+                        plan.position_alpha * wpe.output[0, 0]
+                        + (1.0 - plan.position_alpha) * wpe.output[0, 1])
+
+            # Keep accesses in decoder execution order: pre-LN -> QKV -> attention ->
+            # MLP -> block output.  NNsight raises MissedProviderError if reordered.
+            for i in range(self.num_layers):
+                block = self._block(i)
+                attn = self._attn(block)
+                x = _resolve(block, self.spec.pre_ln_path).output
+                qkv = _resolve(attn, self.spec.qkv_path)
+
+                if capture_pre_ln and i in selected:
+                    saved_pre_ln.append(x[0].save())
+
+                if q_bias is not None and q_bias[i] is not None:
+                    qkv.output[..., :H] -= (1.0 - plan.query_bias_scale) * q_bias[i]
+                if wk_ops is not None:
+                    cols, correction = wk_ops[i]
+                    delta = x[..., cols] @ correction
+                    qkv.output[..., H:2 * H] -= (1.0 - plan.wk_scale) * delta
+
+                if capture_qk and i in selected:
+                    if capture_qk_position0_only:
+                        saved_qk.append(qkv.output[0, 0:1, :2 * H].save())
+                    else:
+                        saved_qk.append(qkv.output[0, :, :2 * H].save())
+
+                if i in selected and attention != "none":
+                    probs = attn.output[1]
+                    if attention == "full":
+                        saved_attention.append(probs[0].save())
+                    elif attention == "targets":
+                        for target in targets:
+                            saved_targets[target].append(
+                                probs[0, :, second_half:, target].mean(dim=1).save())
+                    elif attention == "metrics":
+                        p = probs[0, :, second_half:, :]
+                        # Match E5's historical metric definition exactly: renormalize
+                        # each causal row before entropy/rank/mass summaries. Masked future
+                        # keys are zero under eager attention and therefore do not contribute.
+                        p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                        bos = p[..., 0]
+                        entropy = -(p * p.clamp_min(1e-12).log()).sum(dim=-1)
+                        rank = 1 + (p[..., 1:] > bos.unsqueeze(-1)).sum(dim=-1)
+                        local_end = min(5, seq_len)
+                        saved_metrics.append({
+                            "cell_bos": bos.mean(dim=1).save(),
+                            "query_bos": bos.mean(dim=0).save(),
+                            "query_entropy": entropy.mean(dim=0).save(),
+                            "query_rank": rank.float().mean(dim=0).save(),
+                            "query_local": p[..., 1:local_end].sum(dim=-1).mean(dim=0).save(),
+                            "query_far": p[..., 5:].sum(dim=-1).mean(dim=0).save(),
+                        })
+
+                mlp = _resolve(block, self.spec.mlp_out_path)
+                if plan.mlp_edit == "zero_all" or (plan.mlp_edit == "zero_first" and i == 0):
+                    mlp.output[:] = 0
+                elif i == 0 and plan.mlp_edit in {"swap_epe", "swap_pe"}:
+                    out = mlp.output
+                    v0, v1 = swap_dirs
+                    magnitude = (out[0, 0] * v0).sum()
+                    shift = magnitude * v0 - magnitude * v1
+                    delta = torch.zeros_like(out)
+                    delta[0, 0] = -shift
+                    delta[0, 1] = shift
+                    mlp.output = out + delta
+
+                if i in blocks_to_capture:
+                    saved_blocks[i] = block.output[0].save()
+
+            if capture_logits or capture_token_ce:
+                traced_logits = self.lm.lm_head.output
+                if capture_logits:
+                    saved_logits = traced_logits.save()
+                if capture_token_ce:
+                    saved_token_ce = torch.nn.functional.cross_entropy(
+                        traced_logits[0, :-1].float(), ids[0, 1:],
+                        reduction="none").save()
+
+        def cpu_tensor(value, *, fp32=True):
+            if value is None:
+                return None
+            tensor = value.detach()
+            if fp32:
+                tensor = tensor.float()
+            return tensor.cpu()
+
+        result = {
+            "attention": [cpu_tensor(value) for value in saved_attention],
+            "target_attention": {
+                target: (torch.stack([cpu_tensor(value) for value in values])
+                         if values else torch.empty(0))
+                for target, values in saved_targets.items()
+            },
+            "pre_ln": [cpu_tensor(value) for value in saved_pre_ln],
+            "qk": [cpu_tensor(value) for value in saved_qk],
+            "block_outputs": {
+                index: cpu_tensor(value)[0] for index, value in saved_blocks.items()
+            },
+            "logits": cpu_tensor(saved_logits),
+            "token_ce": cpu_tensor(saved_token_ce),
+            "band": (ls, le),
+            "plan_key": plan.key,
+        }
+        if saved_metrics:
+            result["attention_summary"] = {
+                key: torch.stack([cpu_tensor(layer[key]) for layer in saved_metrics])
+                for key in saved_metrics[0]
+            }
+            result["attention_summary"]["query_entropy"] /= entropy_normalizer
+            result["attention_summary"]["sequence_length"] = seq_len
+            result["attention_summary"]["second_half_start"] = second_half
+        else:
+            result["attention_summary"] = {}
+        return result
+
+    def engine_info(self, *, model_name: Optional[str] = None,
+                    revision: Optional[str] = None, dtype: Optional[str] = None,
+                    device: Optional[Any] = None,
+                    band: Optional[Tuple[int, int]] = None,
+                    registry_version: Optional[str] = None) -> dict:
+        """Complete NNsight provenance fields for a run configuration."""
         import nnsight
         import transformers
+        if device is None and not self.remote:
+            try:
+                device = next(self.hf.parameters()).device
+            except (StopIteration, AttributeError):
+                device = None
         return {
             "name": "nnsight",
             "nnsight_version": nnsight.__version__,
             "remote": self.remote,
+            "execution_location": "remote" if self.remote else "local",
             "attn_implementation": "eager",
             "attn_probs_source": f"{self.spec.blocks_path}[i].{self.spec.attn_path}.output[1]",
+            "attention_probability_source": (
+                f"{self.spec.blocks_path}[i].{self.spec.attn_path}.output[1]"),
             "transformers_version": transformers.__version__,
             "torch_version": torch.__version__,
+            "model_name": model_name,
+            "model_revision": revision or "main",
+            "dtype": dtype,
+            "device": None if device is None else str(device),
+            "layer_band": None if band is None else [int(band[0]), int(band[1])],
+            "intervention_registry_version": registry_version,
         }
 
 

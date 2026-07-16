@@ -61,6 +61,7 @@ import torch
 from scipy import stats as scipy_stats
 from tqdm import tqdm
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import transformers
 
 # Shared analysis modules live in the repository's top-level ``common/`` folder
 # (one master copy each). Make them importable regardless of the launch directory.
@@ -89,12 +90,23 @@ from residual_sink_analysis import (
     run_config,
     bos_metric,
     iter_examples,
+    iter_token_ids,
     count_examples,
     collect_decomposition_and_alignment,
+    collect_traced_decomposition_and_alignment,
+    ResidualExecutor,
+    ResidualInterventionSpec,
+    target_metric,
     _pe_remove_first,
     SINK_POS,
 )
 from experiments_single_input import _compute_perhead_epe_cosine
+from nnsight_engine import (
+    ARCH_SPECS,
+    GPT2_TRACE_REGISTRY_VERSION,
+    NNsightEngine,
+    load_nnsight_model,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Registry & constants  (VERIFY the run ids on a networked box — see .md/E3.md §Caveats)
@@ -133,6 +145,7 @@ PAPER_REFERENCE = {"sink_strength": 0.563, "massive_coords": [138, 378, 447]}
 
 DEFAULT_DATA_SEED = 0
 REVISION_PREFIX = "checkpoint-"
+E3_REGISTRY_VERSION = "e3-emergence-spec-v1"
 ALL_MODES = ["trajectories", "universality", "efficacy", "two_pathway"]
 DATA_MODES = {"trajectories", "efficacy", "two_pathway"}   # modes that need forward passes
 
@@ -152,7 +165,8 @@ ONSET_SIGNALS = ["sink_strength", "epe1_max_abs", "align_bias_pos0",
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_checkpoint(model_name, device, dtype=torch.float32, revision=None, cache_dir=None,
-                    load_tokenizer=True):
+                    load_tokenizer=True, tokenizer=None, engine="manual",
+                    local_files_only=False):
     """Load a GPT-2 checkpoint at an optional HF ``revision`` (e.g. 'checkpoint-1000').
 
     No other harness in the repo threads ``revision``; that is the whole reason E3 needs a
@@ -164,7 +178,35 @@ def load_checkpoint(model_name, device, dtype=torch.float32, revision=None, cach
     checkpoints. That avoids ~4 tokenizer-file downloads per checkpoint — anonymous, rate-limited
     requests that were the step observed hanging mid-run.
     """
-    load_kw = dict(revision=revision, cache_dir=cache_dir, attn_implementation="eager")
+    if tokenizer is None and load_tokenizer:
+        try:
+            tokenizer = GPT2Tokenizer.from_pretrained(
+                model_name, revision=revision, cache_dir=cache_dir,
+                local_files_only=local_files_only)
+        except Exception:
+            tokenizer = GPT2Tokenizer.from_pretrained(
+                "gpt2", local_files_only=local_files_only)
+
+    if engine == "nnsight":
+        if tokenizer is None:
+            raise ValueError("NNsight checkpoint loading requires the reused GPT-2 tokenizer")
+        try:
+            lm = load_nnsight_model(
+                ARCH_SPECS["gpt2"], model_name, dtype=dtype, tokenizer=tokenizer,
+                device=device, revision=revision, cache_dir=cache_dir,
+                local_files_only=local_files_only, prefer_bin=True)
+            nn_engine = NNsightEngine(lm, ARCH_SPECS["gpt2"])
+        except Exception as exc:
+            raise RuntimeError(
+                f"NNsight failed to initialize checkpoint {model_name!r} "
+                f"revision {revision or 'main'!r}; no manual fallback was used: {exc}"
+            ) from exc
+        return lm._model, tokenizer, nn_engine
+    if engine != "manual":
+        raise ValueError(f"Unknown execution engine: {engine!r}")
+
+    load_kw = dict(revision=revision, cache_dir=cache_dir,
+                   attn_implementation="eager", local_files_only=local_files_only)
     # Load the .bin weights directly (use_safetensors=False) FIRST. On a .bin-only checkpoint,
     # *asking* for safetensors is what makes transformers spawn its background "auto_conversion"
     # thread — it tries to open a .bin->safetensors conversion PR on the Hub and dies with an
@@ -178,13 +220,7 @@ def load_checkpoint(model_name, device, dtype=torch.float32, revision=None, cach
     model.to(device)
     model.eval()
     model.to(dtype)
-    tokenizer = None
-    if load_tokenizer:
-        try:
-            tokenizer = GPT2Tokenizer.from_pretrained(model_name, revision=revision, cache_dir=cache_dir)
-        except Exception:
-            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    return model, tokenizer
+    return model, tokenizer, None
 
 
 def discover_checkpoints(repo_id):
@@ -288,25 +324,49 @@ def measure_weight_signals(model, device, band, num_positions, n_std=3.0):
     }
 
 
-def measure_data_signals(model, tokenizer, sampled, massive_coords, band):
+def measure_data_signals(model, tokenizer, sampled, massive_coords, band,
+                         executor=None):
     """Data-dependent signals in one pass: S(t), D(t), B(t), pathway attentions, and efficacy."""
-    num_layers = len(model.transformer.h)
     ls, le = band
+    executor = executor or ResidualExecutor(model, "manual", massive_coords=massive_coords)
+    specs = {
+        "baseline": ResidualInterventionSpec("baseline"),
+        "nullify_bq": ResidualInterventionSpec("nullify_bq", query_bias_scale=0.0),
+        "remove_first_pe": ResidualInterventionSpec(
+            "remove_first_pe", position_edit="remove_first"),
+        "zero_topk_wk": ResidualInterventionSpec(
+            "zero_topk_wk", wk_kind="massive", wk_scale=0.0),
+    }
     acc = {k: [] for k in (
         "S_base", "eff_bq_raw", "eff_pe_raw", "eff_wk_raw",
         "attn_delta", "attn_content", "align_red", "align_blue", "share_delta")}
     first = True
-    for _ds, _ids, te, pe in tqdm(iter_examples(model, tokenizer, sampled),
-                                  total=count_examples(sampled), desc="  data signals", leave=False):
-        acc["S_base"].append(bos_metric(run_config(model, te, pe), num_layers, SINK_POS, band=band))
-        acc["eff_bq_raw"].append(
-            bos_metric(run_config(model, te, pe, nullify_bq=True), num_layers, SINK_POS, band=band))
-        acc["eff_pe_raw"].append(
-            bos_metric(run_config(model, te, pe, pe_transform=_pe_remove_first), num_layers, SINK_POS, band=band))
-        acc["eff_wk_raw"].append(
-            bos_metric(run_config(model, te, pe, wk_zero_coords=massive_coords), num_layers, SINK_POS, band=band))
-        stats = collect_decomposition_and_alignment(
-            model, te, pe, layer_start=ls, layer_end=le, assert_identity=first)
+    for _ds, ids in tqdm(iter_token_ids(model, tokenizer, sampled),
+                         total=count_examples(sampled), desc="  data signals", leave=False):
+        prepared = executor.prepare(ids)
+        baseline = executor.execute(
+            ids, specs["baseline"], band, attention="targets",
+            target_positions=(SINK_POS,), capture_qk=(executor.engine == "nnsight"),
+            prepared=prepared)
+        bq = executor.execute(ids, specs["nullify_bq"], band, attention="targets",
+                              target_positions=(SINK_POS,), prepared=prepared)
+        pe_removed = executor.execute(
+            ids, specs["remove_first_pe"], band, attention="targets",
+            target_positions=(SINK_POS,), prepared=prepared)
+        wk_zeroed = executor.execute(
+            ids, specs["zero_topk_wk"], band, attention="targets",
+            target_positions=(SINK_POS,), prepared=prepared)
+        acc["S_base"].append(target_metric(baseline, SINK_POS))
+        acc["eff_bq_raw"].append(target_metric(bq, SINK_POS))
+        acc["eff_pe_raw"].append(target_metric(pe_removed, SINK_POS))
+        acc["eff_wk_raw"].append(target_metric(wk_zeroed, SINK_POS))
+        if executor.engine == "manual":
+            pe, te = prepared
+            stats = collect_decomposition_and_alignment(
+                model, te, pe, layer_start=ls, layer_end=le, assert_identity=first)
+        else:
+            stats = collect_traced_decomposition_and_alignment(
+                model, baseline, assert_identity=first)
         first = False
         for k in ("attn_delta", "attn_content", "align_red", "align_blue", "share_delta"):
             acc[k].append(float(np.mean(stats[k])))
@@ -326,11 +386,15 @@ def measure_data_signals(model, tokenizer, sampled, massive_coords, band):
     }
 
 
-def measure_checkpoint(model, tokenizer, sampled, device, band, modes, num_positions):
+def measure_checkpoint(model, tokenizer, sampled, device, band, modes, num_positions,
+                       engine="manual", nn_engine=None):
     """Combine the requested signals for one loaded checkpoint into a single flat row dict."""
     row = measure_weight_signals(model, device, band, num_positions)
     if DATA_MODES & set(modes):
-        row.update(measure_data_signals(model, tokenizer, sampled, row["massive_coords"], band))
+        executor = ResidualExecutor(
+            model, engine, nn_engine, massive_coords=row["massive_coords"])
+        row.update(measure_data_signals(
+            model, tokenizer, sampled, row["massive_coords"], band, executor=executor))
     return row
 
 
@@ -728,6 +792,110 @@ def _write_converged_table(df, path):
 # Run orchestration
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _e3_engine_provenance(engine, model, *, nn_engine, model_name, revision,
+                          dtype, device, band):
+    if engine == "nnsight":
+        return nn_engine.engine_info(
+            model_name=model_name, revision=revision, dtype=dtype, device=device,
+            band=band, registry_version=E3_REGISTRY_VERSION)
+    return {
+        "name": "manual", "nnsight_version": None,
+        "transformers_version": transformers.__version__,
+        "torch_version": torch.__version__,
+        "model_name": model_name, "model_revision": revision or "main",
+        "dtype": dtype, "device": str(device), "remote": False,
+        "execution_location": "local",
+        "attn_implementation": "manual_reimplementation",
+        "attention_probability_source": "common.intervention_analysis.manual_self_attention_new",
+        "layer_band": [int(band[0]), int(band[1])],
+        "intervention_registry_version": E3_REGISTRY_VERSION,
+    }
+
+
+def _e3_critical_config(args, run_id, revision, step):
+    return {
+        "registry_version": E3_REGISTRY_VERSION,
+        "trace_registry_version": GPT2_TRACE_REGISTRY_VERSION,
+        "engine_name": args.engine,
+        "run_id": run_id,
+        "revision": revision or "main",
+        "step": int(step),
+        "checkpoint_step": int(step),
+        "dtype": args.dtype,
+        "layer_mode": args.layer_mode,
+        "data_seed": int(args.data_seed),
+        "sample_size": int(args.sample_size),
+        "cut_length": int(args.cut_length),
+    }
+
+
+def _validate_e3_config(path, requested, *, write=False, extra=None):
+    if path.exists():
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        mismatch = {key: (cached.get(key), value) for key, value in requested.items()
+                    if cached.get(key) != value}
+        if mismatch:
+            detail = ", ".join(
+                f"{key}: cached={old!r}, requested={new!r}"
+                for key, (old, new) in mismatch.items())
+            raise ValueError(f"Incompatible E3 checkpoint cache at {path}: {detail}")
+    elif not write:
+        raise FileNotFoundError(
+            f"Missing E3 run metadata {path}; a metrics.json without engine metadata "
+            "cannot be reused safely")
+    if write:
+        path.write_text(json.dumps({**requested, **(extra or {})}, indent=2,
+                                   sort_keys=True), encoding="utf-8")
+
+
+def validate_e3_plot_cache(root, args):
+    configs = sorted(root.glob("run_*/step_*/run_config.json"))
+    if not configs:
+        raise FileNotFoundError(f"No per-checkpoint run_config.json found under {root}")
+    for path in configs:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        expected = {
+            "registry_version": E3_REGISTRY_VERSION,
+            "trace_registry_version": GPT2_TRACE_REGISTRY_VERSION,
+            "engine_name": args.engine,
+            "dtype": args.dtype,
+            "layer_mode": args.layer_mode,
+            "data_seed": int(args.data_seed),
+            "sample_size": int(args.sample_size),
+            "cut_length": int(args.cut_length),
+        }
+        mismatch = {key: (cached.get(key), value) for key, value in expected.items()
+                    if cached.get(key) != value}
+        if mismatch:
+            detail = ", ".join(
+                f"{key}: cached={old!r}, requested={new!r}"
+                for key, (old, new) in mismatch.items())
+            raise ValueError(f"Incompatible E3 plot cache at {path}: {detail}")
+
+
+def verify_e3_parity(model, tokenizer, sampled, device, band, nn_engine,
+                     *, atol=1e-5, rtol=1e-4):
+    """Compare every forward-derived E3 scalar on one model/checkpoint."""
+    coords = measure_weight_signals(model, device, band, num_positions=band[1])["massive_coords"]
+    manual = ResidualExecutor(model, "manual", massive_coords=coords)
+    traced = ResidualExecutor(model, "nnsight", nn_engine, coords)
+    manual_values = measure_data_signals(
+        model, tokenizer, sampled, coords, band, executor=manual)
+    traced_values = measure_data_signals(
+        model, tokenizer, sampled, coords, band, executor=traced)
+    rows = []
+    for key in sorted(manual_values):
+        left, right = float(manual_values[key]), float(traced_values[key])
+        abs_diff = abs(left - right)
+        rel_diff = abs_diff / max(abs(right), 1e-12)
+        passed = abs_diff <= atol + rtol * abs(right)
+        rows.append({"quantity": key, "manual": left, "nnsight_reference": right,
+                     "absolute_difference": abs_diff, "relative_difference": rel_diff,
+                     "atol": atol, "rtol": rtol,
+                     "status": "pass" if passed else "fail"})
+    return {"reference": "NNsight real Hugging Face forward", "rows": rows,
+            "all_rows_pass": all(row["status"] == "pass" for row in rows)}
+
 def resolve_runs(args):
     if args.model_name:
         return [args.model_name]
@@ -743,7 +911,7 @@ def run_experiment(args, root, modes):
     if device.type == "cuda":
         print(f"Device: cuda ({torch.cuda.get_device_name(0)}), dtype {args.dtype}")
     else:
-        print("Device: CPU  [WARNING] CUDA not detected — this will be ~50-100x slower than a GPU. "
+        print("Device: CPU  [WARNING] CUDA not detected - this will be ~50-100x slower than a GPU. "
               "Install the CUDA build of torch (torch==2.10.0+cu128) to use the 4080 Super.")
     runs = resolve_runs(args)
     targets = ([int(s) for s in args.checkpoints.split(",")]
@@ -752,8 +920,10 @@ def run_experiment(args, root, modes):
     # Fixed evaluation sample (identical across every run + checkpoint). Uses the base gpt2 BPE,
     # which every Mistral run shares, so the 300 examples are literally the same tokens everywhere.
     sampled = manifest = sampling_tok = None
+    if DATA_MODES & set(modes) or args.engine == "nnsight":
+        sampling_tok = GPT2Tokenizer.from_pretrained(
+            args.tokenizer_name, cache_dir=args.cache_dir)
     if DATA_MODES & set(modes):
-        sampling_tok = GPT2Tokenizer.from_pretrained(args.tokenizer_name)
         sampled, manifest = sample_benchmark_datasets(
             sampling_tok, sample_size=args.sample_size, cut_length=args.cut_length,
             seed=args.data_seed)
@@ -762,7 +932,8 @@ def run_experiment(args, root, modes):
     for run_id in runs:
         print(f"\n{'='*72}\nRUN {run_id}\n{'='*72}")
         if args.model_name:                       # single-model fidelity mode: no revisions
-            selected = [(0, args.revision)]
+            match = re.fullmatch(re.escape(REVISION_PREFIX) + r"(\d+)", args.revision or "")
+            selected = [(int(match.group(1)) if match else 0, args.revision)]
         else:
             available = discover_checkpoints(run_id)
             selected = select_checkpoints(available, targets, n=args.n_checkpoints)
@@ -770,24 +941,39 @@ def run_experiment(args, root, modes):
                   f"{[s for s, _ in selected]}")
         for step, revision in tqdm(selected, desc=f"  {_run_short(run_id)} checkpoints"):
             out_dir = _ckpt_dir(root, run_id, step)
+            requested_config = _e3_critical_config(args, run_id, revision, step)
+            if (out_dir / "run_config.json").exists():
+                _validate_e3_config(
+                    out_dir / "run_config.json", requested_config, write=False)
             if args.skip_existing and (out_dir / "metrics.json").exists():
+                _validate_e3_config(
+                    out_dir / "run_config.json",
+                    requested_config, write=False)
                 continue
-            model, _ = load_checkpoint(run_id, device, dtype=dtype, revision=revision,
-                                       load_tokenizer=False)  # reuse the one gpt2 tokenizer below
+            model, _tokenizer, nn_engine = load_checkpoint(
+                run_id, device, dtype=dtype, revision=revision,
+                cache_dir=args.cache_dir, load_tokenizer=False,
+                tokenizer=sampling_tok, engine=args.engine)
             num_layers = len(model.transformer.h)
             band = compute_band(num_layers, args.layer_mode)
-            row = measure_checkpoint(model, sampling_tok, sampled, device, band, modes, args.cut_length)
+            row = measure_checkpoint(
+                model, sampling_tok, sampled, device, band, modes, args.cut_length,
+                engine=args.engine, nn_engine=nn_engine)
             row.update({"run": _run_short(run_id), "run_id": run_id, "step": int(step),
                         "revision": revision})
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "metrics.json").write_text(json.dumps(row, indent=2))
-            (out_dir / "run_config.json").write_text(json.dumps({
-                "run_id": run_id, "revision": revision, "step": int(step),
+            provenance = _e3_engine_provenance(
+                args.engine, model, nn_engine=nn_engine, model_name=run_id,
+                revision=revision, dtype=args.dtype, device=device, band=band)
+            _validate_e3_config(out_dir / "run_config.json", requested_config, write=True, extra={
+                "engine": provenance,
                 "dtype": args.dtype, "layer_mode": args.layer_mode,
                 "band_start": band[0], "band_end": band[1], "num_layers": num_layers,
                 "massive_coords": row.get("massive_coords"), "data_seed": args.data_seed,
                 "sample_size": args.sample_size, "cut_length": args.cut_length,
-            }, indent=2))
+            })
+            del nn_engine
             del model
             gc.collect()
             if torch.cuda.is_available():
@@ -821,15 +1007,14 @@ def _smoke_test(output_dir="results"):
                          vocab_size=512, attn_implementation="eager")
         return GPT2LMHeadModel(cfg).to(device).eval()
 
-    def fake_iter(model, tokenizer, sampled):
+    def fake_ids(model, tokenizer, sampled):
         g = torch.Generator().manual_seed(sampled["_seed"])
         for _ in range(sampled["_n"]):
             ids = torch.randint(0, model.config.vocab_size, (1, 40), generator=g).to(model.device)
-            pos_enc, token_embeddings = get_initial_embeddings(model, {"input_ids": ids})
-            yield "fake", ids, token_embeddings, pos_enc
+            yield "fake", ids
 
-    # Patch the example iterator that measure_data_signals looks up in this module's globals.
-    mod.iter_examples = fake_iter
+    # Patch the exact-token iterator that measure_data_signals resolves in this module.
+    mod.iter_token_ids = fake_ids
     mod.count_examples = lambda sampled: sampled["_n"]
 
     modes = ALL_MODES
@@ -889,6 +1074,8 @@ def build_parser():
                    help="Single model id for the reuse-fidelity check (e.g. 'gpt2'); "
                         "analyzes one checkpoint (--revision) instead of a Mistral sweep.")
     p.add_argument("--revision", default=None, help="HF revision for --model-name (default: main).")
+    p.add_argument("--cache-dir", default=None,
+                   help="Optional Hugging Face cache directory.")
     p.add_argument("--checkpoints", default="auto",
                    help="'auto' (log-spaced targets snapped to available) or a comma list of steps.")
     p.add_argument("--n-checkpoints", type=int, default=18,
@@ -906,6 +1093,9 @@ def build_parser():
     p.add_argument("--cut-length", type=int, default=DEFAULT_CUT_LENGTH)
     p.add_argument("--layer-mode", choices=["scaled", "fixed"], default="scaled")
     p.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    p.add_argument("--engine", choices=["manual", "nnsight"], default="manual",
+                   help="Execution engine. Manual remains the default; nnsight runs the real "
+                        "Hugging Face forward at each exact checkpoint revision.")
     p.add_argument("--purge-cache", action="store_true",
                    help="Delete each checkpoint's HF cache after analysis (bounds peak disk).")
     p.add_argument("--skip-existing", action="store_true",
@@ -914,12 +1104,21 @@ def build_parser():
                    help="Skip all computation; aggregate + plot from cached metrics.json.")
     p.add_argument("--smoke-test", action="store_true",
                    help="Run the offline end-to-end smoke test on a random GPT-2 and exit.")
+    p.add_argument("--verify-parity", action="store_true",
+                   help="Compare all forward-derived E3 quantities between manual and NNsight "
+                        "for one --model-name/--revision, write parity_report.json, and exit.")
+    p.add_argument("--parity-atol", type=float, default=1e-5)
+    p.add_argument("--parity-rtol", type=float, default=1e-4)
     return p
 
 
 def main():
     args = build_parser().parse_args()
     if args.smoke_test:
+        if args.engine == "nnsight":
+            raise ValueError(
+                "The NNsight offline smoke test is tests/nnsight_e3_smoke.py; "
+                "the manual smoke path was not substituted.")
         _smoke_test(args.output_dir)
         return
 
@@ -937,11 +1136,44 @@ def main():
                 print(f"{run_id}: ERROR {e}")
         return
 
-    if not args.plot_only:
-        run_experiment(args, root, modes)
+    if args.plot_only:
+        validate_e3_plot_cache(root, args)
+        agg = aggregate_and_plot(root, modes)
+        print(f"Plots and aggregate tables regenerated from cache: {agg}")
+        return
+
+    if args.verify_parity:
+        if not args.model_name:
+            raise ValueError("--verify-parity requires --model-name so only one checkpoint is run")
+        dtype = {"float32": torch.float32, "float16": torch.float16,
+                 "bfloat16": torch.bfloat16}[args.dtype]
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        tokenizer = GPT2Tokenizer.from_pretrained(
+            args.tokenizer_name, cache_dir=args.cache_dir)
+        sampled, _manifest = sample_benchmark_datasets(
+            tokenizer, sample_size=args.sample_size,
+            cut_length=args.cut_length, seed=args.data_seed)
+        model, _tokenizer, nn_engine = load_checkpoint(
+            args.model_name, device, dtype=dtype, revision=args.revision,
+            cache_dir=args.cache_dir, load_tokenizer=False, tokenizer=tokenizer,
+            engine="nnsight")
+        band = compute_band(len(model.transformer.h), args.layer_mode)
+        report = verify_e3_parity(
+            model, tokenizer, sampled, device, band, nn_engine,
+            atol=args.parity_atol, rtol=args.parity_rtol)
+        (root / "parity_report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8")
+        if not report["all_rows_pass"]:
+            raise AssertionError(
+                "E3 manual/NNsight parity exceeded tolerance; the real Hugging Face "
+                "forward is the reference. See parity_report.json.")
+        print(f"Parity report written to {root / 'parity_report.json'}")
+        return
+
+    run_experiment(args, root, modes)
 
     agg = aggregate_and_plot(root, modes)
-    print(f"\nDone. Aggregated tables + figures → {agg}")
+    print(f"\nDone. Aggregated tables + figures: {agg}")
 
 
 if __name__ == "__main__":

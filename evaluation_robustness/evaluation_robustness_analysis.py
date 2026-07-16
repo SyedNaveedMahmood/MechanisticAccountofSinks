@@ -36,6 +36,7 @@ import torch.nn.functional as F
 from scipy import stats
 from tqdm import tqdm
 from transformers import GPT2Config, GPT2LMHeadModel
+import transformers
 
 # Shared analysis modules live in the repository's top-level ``common/`` folder
 # (one master copy each). Make them importable regardless of the launch directory.
@@ -58,10 +59,15 @@ from intervention_analysis import (
     compute_band,
     manual_self_attention_new,
 )
-from residual_sink_analysis import identify_massive_coords, load_model
+from residual_sink_analysis import identify_massive_coords, load_model_for_engine
+from nnsight_engine import (
+    GPT2TracePlan,
+    GPT2_TRACE_REGISTRY_VERSION,
+    NNsightEngine,
+)
 
 
-REGISTRY_VERSION = "e5-spec-v1"
+REGISTRY_VERSION = "e5-spec-v2-nnsight"
 DEFAULT_SEEDS = (0, 1, 2)
 DEFAULT_LENGTHS = (40, 128, 256, 512, 1024)
 DEFAULT_ALPHAS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
@@ -153,17 +159,20 @@ def build_intervention_specs(alpha: float | None = None) -> dict[str, Interventi
     return specs
 
 
+def _pe_transform_for_spec(spec: InterventionSpec):
+    if spec.pe_transform == "remove_first":
+        return _remove_first_pe
+    if spec.pe_transform == "zero_all":
+        return _zero_all_pe
+    if spec.pe_transform and spec.pe_transform.startswith("interp:"):
+        return _interp_first_pe(float(spec.pe_transform.split(":", 1)[1]))
+    return None
+
+
 def _resolve_transforms(spec: InterventionSpec, pe: torch.Tensor,
                         model: GPT2LMHeadModel) -> tuple[torch.Tensor, torch.Tensor | None, tuple]:
     te_transform = _zero_first_token if spec.te_transform == "zero_first" else None
-    if spec.pe_transform == "remove_first":
-        pe_transform = _remove_first_pe
-    elif spec.pe_transform == "zero_all":
-        pe_transform = _zero_all_pe
-    elif spec.pe_transform and spec.pe_transform.startswith("interp:"):
-        pe_transform = _interp_first_pe(float(spec.pe_transform.split(":", 1)[1]))
-    else:
-        pe_transform = None
+    pe_transform = _pe_transform_for_spec(spec)
     pe_work = pe_transform(pe.clone()) if pe_transform else pe.clone()
     ppes = None
 
@@ -253,6 +262,123 @@ def execute_spec(model: GPT2LMHeadModel, input_ids: torch.Tensor, spec: Interven
     return result
 
 
+def _spec_to_trace_plan(spec: InterventionSpec, massive_coords: Sequence[int],
+                        random_coords: Sequence[int]) -> GPT2TracePlan:
+    """Adapt the E5 source-of-truth spec to the shared NNsight edit vocabulary."""
+    position_edit = None
+    position_alpha = 1.0
+    if spec.pe_transform == "remove_first":
+        position_edit = "remove_first"
+    elif spec.pe_transform == "zero_all":
+        position_edit = "zero_all"
+    elif spec.pe_transform and spec.pe_transform.startswith("interp:"):
+        position_edit = "interp_first"
+        position_alpha = float(spec.pe_transform.split(":", 1)[1])
+
+    coords: tuple[int, ...] = ()
+    wk_scale = 1.0
+    if spec.wk_zero_kind == "massive":
+        coords, wk_scale = tuple(map(int, massive_coords)), 0.0
+    elif spec.wk_zero_kind == "random_fixed":
+        coords, wk_scale = tuple(map(int, random_coords)), 0.0
+    if spec.wk_scale is not None:
+        coords, wk_scale = tuple(map(int, massive_coords)), float(spec.wk_scale)
+    mlp_edit = "zero_all" if spec.skip_all_mlp else spec.mlp_transform
+    return GPT2TracePlan(
+        key=spec.key,
+        token_edit=spec.te_transform,
+        position_edit=position_edit,
+        position_alpha=position_alpha,
+        query_bias_scale=spec.query_bias_scale,
+        mlp_edit=mlp_edit,
+        wk_coords=coords,
+        wk_scale=wk_scale,
+    )
+
+
+def _nnsight_swap_dirs(model: GPT2LMHeadModel, spec: InterventionSpec):
+    if spec.mlp_transform not in {"swap_epe", "swap_pe"}:
+        return None
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        positions = torch.arange(2, device=device).unsqueeze(0)
+        pe = model.transformer.wpe(positions)
+        transform = _pe_transform_for_spec(spec)
+        pe_work = transform(pe.clone()) if transform else pe
+        vectors = (pe_work[0] + model.transformer.h[0].mlp(pe_work)[0]
+                   if spec.mlp_transform == "swap_epe" else pe_work[0])
+        u0 = vectors[0] / torch.linalg.vector_norm(vectors[0]).clamp_min(NUMERIC_EPS)
+        u1 = vectors[1] / torch.linalg.vector_norm(vectors[1]).clamp_min(NUMERIC_EPS)
+    return u0, u1
+
+
+def _trace_invariance(model: GPT2LMHeadModel, trace: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    k0_values, delta_values = [], []
+    hidden = model.config.n_embd
+    heads = model.config.n_head
+    for offset, li in enumerate(range(*trace["band"])):
+        projected = trace["qk"][offset]
+        bias = model.transformer.h[li].attn.c_attn.bias.detach().float().cpu()
+        bq, bk, _ = bias.chunk(3, dim=0)
+        key0 = projected[0, hidden:2 * hidden] - bk
+        k0_values.append(key0)
+        delta_values.append((bq * key0).view(heads, -1).sum(dim=-1))
+    return (torch.stack(k0_values) if k0_values else torch.empty(0),
+            torch.stack(delta_values) if delta_values else torch.empty(0))
+
+
+class E5Executor:
+    """Consume :class:`InterventionSpec` with either manual or real-forward execution."""
+
+    def __init__(self, model, engine="manual", nn_engine: NNsightEngine | None = None):
+        self.model = model
+        self.engine = engine
+        self.nn_engine = nn_engine
+        if engine == "nnsight" and nn_engine is None:
+            raise ValueError("E5 NNsight execution requires an initialized NNsightEngine")
+
+    def execute(self, input_ids, spec, band, massive_coords, random_coords,
+                collect_attention=True, collect_logits=False, collect_invariance=False,
+                full_attention=False, collect_token_ce=False):
+        if self.engine == "manual":
+            result = execute_spec(
+                self.model, input_ids, spec, band, massive_coords, random_coords,
+                collect_attention=collect_attention,
+                collect_logits=(collect_logits or collect_token_ce),
+                collect_invariance=collect_invariance)
+            if collect_token_ce:
+                result["token_ce"] = token_cross_entropy(result["logits"], input_ids)
+                if not collect_logits:
+                    result["logits"] = None
+            else:
+                result["token_ce"] = None
+            return result
+        plan = _spec_to_trace_plan(spec, massive_coords, random_coords)
+        attention_mode = ("full" if full_attention else "metrics") if collect_attention else "none"
+        try:
+            trace = self.nn_engine.run_gpt2_trace(
+                plan, {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)},
+                band=band, attention=attention_mode,
+                capture_qk=collect_invariance, capture_pre_ln=False,
+                capture_qk_position0_only=collect_invariance,
+                capture_logits=collect_logits,
+                capture_token_ce=collect_token_ce,
+                swap_dirs=_nnsight_swap_dirs(self.model, spec))
+        except Exception as exc:
+            raise RuntimeError(
+                f"NNsight execution failed for E5 intervention {spec.key!r}; "
+                f"the manual executor was not used: {exc}") from exc
+        result = {
+            "attention": (trace["attention"] if full_attention
+                          else trace["attention_summary"]),
+            "logits": trace["logits"],
+            "token_ce": trace["token_ce"],
+        }
+        if collect_invariance:
+            result["k0"], result["delta1"] = _trace_invariance(self.model, trace)
+        return result
+
+
 def _gini(values: np.ndarray) -> float:
     x = np.asarray(values, dtype=np.float64).ravel()
     x = np.clip(x, 0.0, None)
@@ -272,6 +398,32 @@ def metric_battery(attn_maps: Sequence[torch.Tensor]) -> tuple[dict[str, float],
     attention)``.  Ties therefore receive the same deterministic best rank.
     Entropy includes only causal keys 0..q and is normalized by log(q+1).
     """
+    if isinstance(attn_maps, dict) and "cell_bos" in attn_maps:
+        cell_bos = attn_maps["cell_bos"].double()
+        length = int(attn_maps["sequence_length"])
+        start = int(attn_maps["second_half_start"])
+        metrics: dict[str, float] = {"bos_attn": float(cell_bos.mean())}
+        for threshold in SINK_THRESHOLDS:
+            metrics[f"sink_rate_{str(threshold).replace('.', '_')}"] = float(
+                (cell_bos > threshold).double().mean())
+        metrics["attn_entropy"] = float(attn_maps["query_entropy"].double().mean())
+        metrics["bos_rank"] = float(attn_maps["query_rank"].double().mean())
+        metrics["mass_pos_1_4"] = float(attn_maps["query_local"].double().mean())
+        metrics["mass_pos_5_plus"] = float(attn_maps["query_far"].double().mean())
+        redistributed = metrics["mass_pos_1_4"] + metrics["mass_pos_5_plus"]
+        metrics["redistributed_local_share"] = (
+            metrics["mass_pos_1_4"] / redistributed if redistributed > NUMERIC_EPS else 0.0)
+        metrics["head_gini"] = _gini(cell_bos.numpy())
+        cell_rows = [
+            {"layer_offset": li, "head": hi, "bos_attn": float(cell_bos[li, hi])}
+            for li in range(cell_bos.shape[0]) for hi in range(cell_bos.shape[1])]
+        query_bos = attn_maps["query_bos"].double().mean(dim=0)
+        query_rows = [
+            {"query_position": q, "valid_positions": q + 1,
+             "bos_attn": float(query_bos[q - start])}
+            for q in range(start, length)]
+        return metrics, pd.DataFrame(cell_rows), pd.DataFrame(query_rows)
+
     if not attn_maps:
         raise ValueError("metric_battery received an empty layer band")
     stack = torch.stack(list(attn_maps)).double()  # [L,H,Q,K], CPU
@@ -318,7 +470,8 @@ def metric_battery(attn_maps: Sequence[torch.Tensor]) -> tuple[dict[str, float],
 
 def token_cross_entropy(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
     """Return one next-token CE value per predicted position, in nats."""
-    return F.cross_entropy(logits[0, :-1].float(), input_ids[0, 1:], reduction="none")
+    labels = input_ids[0, 1:].to(logits.device)
+    return F.cross_entropy(logits[0, :-1].float(), labels, reduction="none")
 
 
 def _parse_csv(value: str, cast: Callable = str) -> list:
@@ -385,8 +538,9 @@ def _write_csv(rows: list[dict], path: Path) -> None:
 def run_metrics_mode(model: GPT2LMHeadModel, model_name: str, seed: int,
                      records: dict[str, list[dict]], band: tuple[int, int],
                      massive: Sequence[int], random_coords: Sequence[int],
-                     out_dir: Path) -> None:
+                     out_dir: Path, executor: E5Executor | None = None) -> None:
     specs = build_intervention_specs()
+    executor = executor or E5Executor(model)
     metric_rows, cell_rows, query_rows = [], [], []
     total = sum(map(len, records.values())) * len(TABLE1_KEYS)
     for domain, row in tqdm(_iter_records(records), total=sum(map(len, records.values())),
@@ -394,7 +548,7 @@ def run_metrics_mode(model: GPT2LMHeadModel, model_name: str, seed: int,
         ids = _to_ids(model, row)
         for key in TABLE1_KEYS:
             spec = specs[key]
-            result = execute_spec(model, ids, spec, band, massive, random_coords)
+            result = executor.execute(ids, spec, band, massive, random_coords)
             metrics, cells, queries = metric_battery(result["attention"])
             base = _base_fields(seed, model_name, domain, row, spec, ids.shape[1])
             metric_rows.append({**base, **metrics, "status": "ok"})
@@ -434,8 +588,9 @@ def run_length_mode(model: GPT2LMHeadModel, model_name: str, seed: int,
                     long_records: dict[str, list[dict]], lengths: Sequence[int],
                     length_sample_size: int, band: tuple[int, int],
                     massive: Sequence[int], random_coords: Sequence[int],
-                    out_dir: Path) -> None:
+                    out_dir: Path, executor: E5Executor | None = None) -> None:
     specs = build_intervention_specs()
+    executor = executor or E5Executor(model)
     metrics_rows, cell_rows, query_rows, invariance_raw = [], [], [], []
     shortest = min(lengths)
     for length in lengths:
@@ -446,8 +601,9 @@ def run_length_mode(model: GPT2LMHeadModel, model_name: str, seed: int,
             ids = _to_ids(model, row)
             for key in LENGTH_KEYS:
                 spec = specs[key]
-                result = execute_spec(model, ids, spec, band, massive, random_coords,
-                                      collect_invariance=(key == "a"))
+                result = executor.execute(
+                    ids, spec, band, massive, random_coords,
+                    collect_invariance=(key == "a"))
                 metrics, cells, queries = metric_battery(result["attention"])
                 base = _base_fields(seed, model_name, domain, row, spec, length)
                 metrics_rows.append({**base, **metrics, "status": "ok"})
@@ -500,18 +656,21 @@ def run_cost_mode(model: GPT2LMHeadModel, model_name: str, seed: int,
                   long_records: dict[str, list[dict]], cut_length: int,
                   alphas: Sequence[float], band: tuple[int, int],
                   massive: Sequence[int], random_coords: Sequence[int],
-                  out_dir: Path, profile_lengths: Sequence[int] = (40, 1024)) -> None:
+                  out_dir: Path, profile_lengths: Sequence[int] = (40, 1024),
+                  executor: E5Executor | None = None) -> None:
     specs = _cost_specs(alphas)
+    executor = executor or E5Executor(model)
     short = _records_at_length(long_records, cut_length)
     cost_rows, cell_rows = [], []
     for domain, row in tqdm(_iter_records(short), total=sum(map(len, short.values())),
                             desc=f"seed {seed} functional cost"):
         ids = _to_ids(model, row)
         for spec in specs:
-            result = execute_spec(model, ids, spec, band, massive, random_coords,
-                                  collect_attention=True, collect_logits=True)
+            result = executor.execute(
+                ids, spec, band, massive, random_coords,
+                collect_attention=True, collect_token_ce=True)
             status, warning = "ok", ""
-            ce_tokens = token_cross_entropy(result["logits"], ids)
+            ce_tokens = result["token_ce"]
             finite = torch.isfinite(ce_tokens)
             if not bool(finite.all()):
                 status = "nonfinite_ce"
@@ -539,9 +698,10 @@ def run_cost_mode(model: GPT2LMHeadModel, model_name: str, seed: int,
             ids = _to_ids(model, row)
             for key in PROFILE_KEYS:
                 spec = table[key]
-                result = execute_spec(model, ids, spec, band, massive, random_coords,
-                                      collect_attention=False, collect_logits=True)
-                losses = token_cross_entropy(result["logits"], ids).detach().cpu().numpy()
+                result = executor.execute(
+                    ids, spec, band, massive, random_coords,
+                    collect_attention=False, collect_token_ce=True)
+                losses = result["token_ce"].detach().cpu().numpy()
                 for pos, loss in enumerate(losses, start=1):
                     norm = pos / max(1, length - 1)
                     bin_id = min(9, int(norm * 10))
@@ -562,7 +722,9 @@ def run_content_mode(model: GPT2LMHeadModel, model_name: str, seed: int,
                      natural: dict[str, list[dict]], domains: Sequence[str],
                      with_multilingual: bool, cut_length: int, band: tuple[int, int],
                      massive: Sequence[int], random_coords: Sequence[int],
-                     out_dir: Path, tokenizer: Any) -> tuple[list[dict], str | None]:
+                     out_dir: Path, tokenizer: Any,
+                     executor: E5Executor | None = None) -> tuple[list[dict], str | None]:
+    executor = executor or E5Executor(model)
     requested_synthetic = [d for d in domains if d in
                            {"random_uniform", "random_zipf", "shuffled_natural", "repeat_token"}]
     synthetic, synthetic_manifest = build_degenerate_domains(
@@ -588,7 +750,7 @@ def run_content_mode(model: GPT2LMHeadModel, model_name: str, seed: int,
         ids = _to_ids(model, {**row, "length": cut_length})
         for key in TABLE1_KEYS:
             spec = specs[key]
-            result = execute_spec(model, ids, spec, band, massive, random_coords)
+            result = executor.execute(ids, spec, band, massive, random_coords)
             metrics, _, _ = metric_battery(result["attention"])
             metric_rows.append({**_base_fields(seed, model_name, domain, row, spec, cut_length),
                                 **metrics, "source_domain": row.get("source_domain", domain),
@@ -1019,7 +1181,11 @@ def aggregate_and_plot(root: Path, seeds: Sequence[int], modes: Sequence[str],
 def _critical_config(args: argparse.Namespace, mode: str, seed: int,
                      band: tuple[int, int] | None = None) -> dict[str, Any]:
     config = {
-        "registry_version": REGISTRY_VERSION, "model_name": args.model_name,
+        "registry_version": REGISTRY_VERSION,
+        "trace_registry_version": GPT2_TRACE_REGISTRY_VERSION,
+        "engine_name": args.engine,
+        "model_name": args.model_name,
+        "model_revision": args.revision or "main",
         "dtype": args.dtype, "layer_mode": args.layer_mode, "seed": seed,
         "mode": mode, "sample_size": args.sample_size, "cut_length": args.cut_length,
         "random_wk_seed": args.random_wk_seed,
@@ -1035,6 +1201,25 @@ def _critical_config(args: argparse.Namespace, mode: str, seed: int,
     if band is not None:
         config.update(band_start=band[0], band_end=band[1])
     return config
+
+
+def _e5_engine_provenance(engine, model, *, nn_engine, args, device, band):
+    if engine == "nnsight":
+        return nn_engine.engine_info(
+            model_name=args.model_name, revision=args.revision, dtype=args.dtype,
+            device=device, band=band, registry_version=REGISTRY_VERSION)
+    return {
+        "name": "manual", "nnsight_version": None,
+        "transformers_version": transformers.__version__,
+        "torch_version": torch.__version__,
+        "model_name": args.model_name, "model_revision": args.revision or "main",
+        "dtype": args.dtype, "device": str(device), "remote": False,
+        "execution_location": "local",
+        "attn_implementation": "manual_reimplementation",
+        "attention_probability_source": "common.intervention_analysis.manual_self_attention_new",
+        "layer_band": [int(band[0]), int(band[1])],
+        "intervention_registry_version": REGISTRY_VERSION,
+    }
 
 
 def _validate_or_write_config(path: Path, requested: dict[str, Any],
@@ -1057,40 +1242,68 @@ def _validate_or_write_config(path: Path, requested: dict[str, Any],
 
 def verify_parity(model: GPT2LMHeadModel, input_ids: torch.Tensor,
                   band: tuple[int, int], massive: Sequence[int], random_coords: Sequence[int],
-                  atol: float = 1e-6, rtol: float = 1e-5) -> dict[str, Any]:
-    """Compare optimized specifications with the legacy Table-1 registry.
+                  nn_engine: NNsightEngine, atol: float = 1e-5,
+                  rtol: float = 1e-4,
+                  alphas: Sequence[float] = (0.0, 1.0)) -> dict[str, Any]:
+    """Compare E5's manual executor with the real traced Hugging Face forward.
 
-    Intervention (j) is reported as an intentional controlled deviation: legacy
-    code draws new random coordinates inside every layer, whereas E5 fixes one
-    seeded coordinate set for the complete run.  All other rows are strict parity
-    checks on identical token and positional embeddings.
+    Coverage includes every Table-1 and E4-combination spec, representative dose
+    points, raw selected-band attention, every alternative metric, BOS attention,
+    next-token CE, and the position-zero key/Delta diagnostics.  NNsight is the
+    reference when a genuine difference is found.
     """
-    te, pe = _initial_embeddings(model, input_ids)
-    specs = build_intervention_specs()
-    legacy = {key.removeprefix("int_"): fn for key, _label, _desc, fn in INTERVENTIONS}
+    manual = E5Executor(model, "manual")
+    traced = E5Executor(model, "nnsight", nn_engine)
     rows = []
-    for key in TABLE1_KEYS:
-        optimized = execute_spec(model, input_ids, specs[key], band, massive, random_coords)["attention"]
-        with torch.no_grad():
-            if key == "j":
-                rows.append({"intervention": key, "status": "intentional_deviation",
-                             "max_abs_attention_difference": np.nan,
-                             "note": "E5 uses fixed seeded Wk coordinates; legacy resamples per layer."})
-                continue
-            reference_all = legacy[key](model, te, pe)
-        reference = [reference_all[li].float().cpu() for li in range(band[0], band[1])]
-        differences = [float((a - b).abs().max()) for a, b in zip(optimized, reference)]
-        max_diff = max(differences, default=np.nan)
-        equal = all(torch.allclose(a, b, atol=atol, rtol=rtol) for a, b in zip(optimized, reference))
-        rows.append({"intervention": key, "status": "pass" if equal else "fail",
-                     "max_abs_attention_difference": max_diff, "atol": atol, "rtol": rtol,
-                     "note": "strict attention parity"})
-    report = {"registry_version": REGISTRY_VERSION, "rows": rows,
-              "all_strict_rows_pass": all(r["status"] == "pass" for r in rows if r["intervention"] != "j")}
-    if not report["all_strict_rows_pass"]:
-        failed = [r["intervention"] for r in rows if r["status"] == "fail"]
-        raise AssertionError(f"E5 parity failed for: {failed}")
-    return report
+
+    def add_row(intervention, quantity, left, right):
+        left_arr = np.asarray(left, dtype=float)
+        right_arr = np.asarray(right, dtype=float)
+        abs_diff = float(np.max(np.abs(left_arr - right_arr)))
+        scale = float(np.max(np.abs(right_arr)))
+        rel_diff = abs_diff / max(scale, NUMERIC_EPS)
+        passed = abs_diff <= atol + rtol * scale
+        rows.append({"intervention": intervention, "quantity": quantity,
+                     "manual": float(np.mean(left_arr)),
+                     "nnsight_reference": float(np.mean(right_arr)),
+                     "max_abs_difference": abs_diff,
+                     "max_relative_difference": rel_diff,
+                     "atol": atol, "rtol": rtol,
+                     "status": "pass" if passed else "fail"})
+
+    for spec in _cost_specs(alphas):
+        collect_invariance = spec.key == "a"
+        left = manual.execute(
+            input_ids, spec, band, massive, random_coords,
+            collect_attention=True, collect_token_ce=True,
+            collect_invariance=collect_invariance,
+            full_attention=True)
+        right = traced.execute(
+            input_ids, spec, band, massive, random_coords,
+            collect_attention=True, collect_token_ce=True,
+            collect_invariance=collect_invariance,
+            full_attention=True)
+        add_row(spec.key, "attention_maps",
+                torch.stack(left["attention"]).numpy(),
+                torch.stack(right["attention"]).numpy())
+        left_metrics, _, _ = metric_battery(left["attention"])
+        right_metrics, _, _ = metric_battery(right["attention"])
+        for metric in sorted(left_metrics):
+            add_row(spec.key, f"metric/{metric}",
+                    left_metrics[metric], right_metrics[metric])
+        add_row(spec.key, "cross_entropy",
+                left["token_ce"].detach().cpu().numpy(),
+                right["token_ce"].detach().cpu().numpy())
+        if collect_invariance:
+            add_row(spec.key, "k0", left["k0"].numpy(), right["k0"].numpy())
+            add_row(spec.key, "delta1", left["delta1"].numpy(), right["delta1"].numpy())
+    return {
+        "registry_version": REGISTRY_VERSION,
+        "trace_registry_version": GPT2_TRACE_REGISTRY_VERSION,
+        "reference": "NNsight real Hugging Face forward",
+        "rows": rows,
+        "all_rows_pass": all(row["status"] == "pass" for row in rows),
+    }
 
 
 class _SmokeTokenizer:
@@ -1129,7 +1342,11 @@ def run_smoke_test(output_dir: Path) -> None:
     metrics, _, _ = metric_battery(baseline["attention"])
     assert 0 <= metrics["attn_entropy"] <= 1 + 1e-10
     assert torch.isfinite(token_cross_entropy(baseline["logits"], ids)).all()
-    report = verify_parity(model, ids, band, massive, random_coords, atol=1e-6, rtol=1e-5)
+    report = {
+        "engine": "manual",
+        "registry_version": REGISTRY_VERSION,
+        "note": "Manual offline smoke coverage; use tests/nnsight_e5_smoke.py for a real NNsight trace.",
+    }
 
     root = output_dir / "e5_smoke"
     tokenizer = _SmokeTokenizer()
@@ -1179,6 +1396,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--mode", choices=["metrics", "length", "cost", "content", "all"], default="all")
     parser.add_argument("--model-name", default="gpt2")
+    parser.add_argument("--revision", default=None,
+                        help="Optional Hugging Face model revision (default: main)")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--lengths", default="40,128,256,512,1024")
     parser.add_argument("--length-sample-size", type=int, default=50,
@@ -1188,6 +1407,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alphas", default="0,0.25,0.5,0.75,1,1.25,1.5")
     parser.add_argument("--layer-mode", choices=["scaled", "fixed"], default="scaled")
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    parser.add_argument("--engine", choices=["manual", "nnsight"], default="manual",
+                        help="Execution engine; manual remains the default")
     parser.add_argument("--domains", default="sst2,gsm8k,humaneval,random_uniform,random_zipf,shuffled_natural,repeat_token",
                         help="Comma-separated benchmark and content-control domains")
     parser.add_argument("--with-multilingual", action="store_true")
@@ -1196,6 +1417,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plot-only", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--verify-parity", action="store_true")
+    parser.add_argument("--parity-atol", type=float, default=1e-5)
+    parser.add_argument("--parity-rtol", type=float, default=1e-4)
     parser.add_argument("--bootstrap-repetitions", type=int, default=2000)
     parser.add_argument("--random-wk-seed", type=int, default=1729)
     return parser
@@ -1230,6 +1453,10 @@ def main() -> None:
     args = parser.parse_args()
     _validate_args(args)
     if args.smoke_test:
+        if args.engine == "nnsight":
+            raise ValueError(
+                "The NNsight offline smoke test is tests/nnsight_e5_smoke.py; "
+                "the manual smoke path was not substituted.")
         run_smoke_test(Path(args.output_dir))
         return
     modes = _requested_modes(args.mode)
@@ -1258,10 +1485,16 @@ def main() -> None:
     dtype = {"float32": torch.float32, "float16": torch.float16,
              "bfloat16": torch.bfloat16}[args.dtype]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    load_engine = "nnsight" if args.verify_parity else args.engine
     try:
-        model, tokenizer = load_model(args.model_name, device, dtype=dtype)
+        model, tokenizer, nn_engine = load_model_for_engine(
+            args.model_name, device, dtype=dtype, engine=load_engine,
+            revision=args.revision)
     except Exception as exc:
-        raise RuntimeError(f"Unable to load GPT-2-compatible model {args.model_name!r}: {exc}") from exc
+        raise RuntimeError(
+            f"Unable to initialize requested E5 engine {load_engine!r} for "
+            f"GPT-2-compatible model {args.model_name!r}; no engine fallback was used: {exc}"
+        ) from exc
     if not isinstance(model, GPT2LMHeadModel):
         raise TypeError("E5 currently supports Hugging Face GPT2LMHeadModel checkpoints only")
     band = compute_band(len(model.transformer.h), args.layer_mode)
@@ -1276,6 +1509,9 @@ def main() -> None:
     if len(massive) > model.config.n_embd:
         raise ValueError("Massive-coordinate count exceeds hidden dimension")
     random_coords = sorted(rng.sample(range(model.config.n_embd), len(massive)))
+    executor = E5Executor(model, args.engine, nn_engine if args.engine == "nnsight" else None)
+    provenance = _e5_engine_provenance(
+        args.engine, model, nn_engine=nn_engine, args=args, device=device, band=band)
     scientific_deviations = {
         "random_wk_control": "Fixed seeded coordinates for all examples/layers instead of legacy per-layer draws",
         "long_context_sampling": "Deterministic within-domain concatenation; nested lengths are token-ID prefixes",
@@ -1283,12 +1519,30 @@ def main() -> None:
     print(f"Loaded {args.model_name} on {device}; band={band}; massive={massive}; random={random_coords}")
 
     if args.verify_parity:
-        ids = torch.arange(1, min(args.cut_length, 40) + 1, device=device).remainder(
-            model.config.vocab_size).unsqueeze(0)
-        report = verify_parity(model, ids, band, massive, random_coords)
+        parity_rows = []
+        for example_index in range(args.sample_size):
+            ids = (torch.arange(1, min(args.cut_length, 40) + 1, device=device)
+                   + example_index * 31).remainder(model.config.vocab_size).unsqueeze(0)
+            example_report = verify_parity(
+                model, ids, band, massive, random_coords, nn_engine,
+                atol=args.parity_atol, rtol=args.parity_rtol, alphas=args.alphas)
+            for row in example_report["rows"]:
+                parity_rows.append({"example_index": example_index, **row})
+        report = {
+            "registry_version": REGISTRY_VERSION,
+            "trace_registry_version": GPT2_TRACE_REGISTRY_VERSION,
+            "reference": "NNsight real Hugging Face forward",
+            "n_examples": args.sample_size,
+            "rows": parity_rows,
+            "all_rows_pass": all(row["status"] == "pass" for row in parity_rows),
+        }
         root.mkdir(parents=True, exist_ok=True)
         (root / "parity_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(json.dumps(report, indent=2))
+        if not report["all_rows_pass"]:
+            raise AssertionError(
+                "E5 manual/NNsight parity exceeded tolerance; the real Hugging Face "
+                "forward is the reference. See parity_report.json.")
         return
 
     for seed in args.seeds:
@@ -1304,6 +1558,7 @@ def main() -> None:
             requested = _critical_config(args, mode, seed, band)
             requested.update(massive_coords=massive, random_wk_coords=random_coords)
             extra = {"num_layers": len(model.transformer.h), "context_limit": model.config.n_positions,
+                     "engine": provenance,
                      "scientific_deviations": scientific_deviations,
                      "bootstrap_repetitions": args.bootstrap_repetitions,
                      "bootstrap_seed": args.random_wk_seed + 1}
@@ -1316,19 +1571,21 @@ def main() -> None:
             if mode == "metrics":
                 run_metrics_mode(model, args.model_name, seed,
                                  _records_at_length(long_records, args.cut_length), band,
-                                 massive, random_coords, seed_dir)
+                                 massive, random_coords, seed_dir, executor=executor)
             elif mode == "length":
                 run_length_mode(model, args.model_name, seed, long_records, args.lengths,
-                                args.length_sample_size, band, massive, random_coords, seed_dir)
+                                args.length_sample_size, band, massive, random_coords, seed_dir,
+                                executor=executor)
             elif mode == "cost":
                 run_cost_mode(model, args.model_name, seed, long_records, args.cut_length,
-                              args.alphas, band, massive, random_coords, seed_dir)
+                              args.alphas, band, massive, random_coords, seed_dir,
+                              executor=executor)
             elif mode == "content":
                 content_manifest, skip = run_content_mode(
                     model, args.model_name, seed,
                     _records_at_length(long_records, args.cut_length), args.content_domains,
                     args.with_multilingual, args.cut_length, band, massive, random_coords,
-                    seed_dir, tokenizer)
+                    seed_dir, tokenizer, executor=executor)
                 pd.DataFrame(content_manifest).to_csv(seed_dir / "content_manifest.csv", index=False)
                 if skip:
                     meta = json.loads(config_path.read_text(encoding="utf-8"))

@@ -1019,9 +1019,9 @@ def dataset_analysis(model, tokenizer, output_dir,
     all_scope = {}  # ds_name -> {key: [scores]}
 
     for ds_name, sentences in sampled.items():
-        print(f"\n{'═'*60}")
+        print(f"\n{'='*60}")
         print(f"  Dataset: {ds_name}  ({len(sentences)} examples)")
-        print(f"{'═'*60}")
+        print(f"{'='*60}")
         s_mid, s_all = _run_sentences(model, tokenizer, sentences, ds_name, num_layers,
                                       band=band, massive_coords=massive_coords,
                                       run_interventions=run_interventions)
@@ -1056,7 +1056,7 @@ def dataset_analysis(model, tokenizer, output_dir,
     _write_readable_bos_summaries(output_path, pooled_scope, "all_layers")
     _write_readable_bos_summaries(output_path, pooled_mid,   "mid_layers")
 
-    print(f"\n{'═'*60}")
+    print(f"\n{'='*60}")
     print("Pooled results across all datasets:")
     print(df_overall[["intervention", "description", "display"]].to_string(index=False))
     print(f"\nAll outputs saved to {output_path}")

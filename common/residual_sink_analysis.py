@@ -45,8 +45,12 @@ outputs plus a cross-seed ``aggregate/`` directory (CSVs + figures).
 """
 
 import argparse
+import gc
 import json
+import random
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Sequence
 
 import matplotlib
 matplotlib.use("Agg")
@@ -58,6 +62,7 @@ import torch.nn.functional as F
 from scipy import stats as scipy_stats
 from tqdm import tqdm
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import transformers
 
 from datasets_loader import (
     sample_benchmark_datasets,
@@ -73,6 +78,13 @@ from intervention_analysis import (
     LAYER_RANGE_START,
     LAYER_RANGE_END,
 )
+from nnsight_engine import (
+    ARCH_SPECS,
+    GPT2TracePlan,
+    GPT2_TRACE_REGISTRY_VERSION,
+    NNsightEngine,
+    load_nnsight_model,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
@@ -82,6 +94,36 @@ DEFAULT_ALPHAS = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5]
 DEFAULT_SEEDS = [0, 1, 2]
 SINK_POS = 0          # first-token sink position (0-indexed; paper's "position 1")
 RELOCATION_POS = 1    # swap target (0-indexed; paper's "position 2")
+E4_REGISTRY_VERSION = "e4-residual-spec-v1"
+
+
+@dataclass(frozen=True)
+class ResidualInterventionSpec:
+    """One E4 intervention definition shared by manual and NNsight executors."""
+
+    key: str
+    query_bias_scale: float = 1.0
+    token_edit: str | None = None
+    position_edit: str | None = None
+    position_alpha: float = 1.0
+    mlp_edit: str | None = None
+    wk_kind: str | None = None
+    wk_scale: float = 1.0
+
+
+def _residual_plan(spec: ResidualInterventionSpec,
+                   massive_coords: Sequence[int]) -> GPT2TracePlan:
+    coords = tuple(int(c) for c in massive_coords) if spec.wk_kind == "massive" else ()
+    return GPT2TracePlan(
+        key=spec.key,
+        token_edit=spec.token_edit,
+        position_edit=spec.position_edit,
+        position_alpha=spec.position_alpha,
+        query_bias_scale=spec.query_bias_scale,
+        mlp_edit=spec.mlp_edit,
+        wk_coords=coords,
+        wk_scale=spec.wk_scale,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -95,6 +137,60 @@ def load_model(model_name, device, dtype=torch.float32):
     model.eval()
     model.to(dtype)  # default fp32 to match the paper's SEs; smaller dtype for large XL runs
     return model, tokenizer
+
+
+def load_model_for_engine(model_name, device, dtype=torch.float32, engine="manual",
+                          revision=None, local_files_only=False):
+    """Load one GPT-2 checkpoint for the requested engine without fallback."""
+    tokenizer = GPT2Tokenizer.from_pretrained(
+        model_name, revision=revision, local_files_only=local_files_only)
+    if engine == "manual":
+        kwargs = {"attn_implementation": "eager", "revision": revision,
+                  "local_files_only": local_files_only}
+        model = GPT2LMHeadModel.from_pretrained(model_name, **kwargs)
+        model.to(device)
+        model.eval()
+        model.to(dtype)
+        return model, tokenizer, None
+    if engine != "nnsight":
+        raise ValueError(f"Unknown execution engine: {engine!r}")
+    try:
+        lm = load_nnsight_model(
+            ARCH_SPECS["gpt2"], model_name, dtype=dtype, tokenizer=tokenizer,
+            device=device, revision=revision, local_files_only=local_files_only)
+        nn_engine = NNsightEngine(lm, ARCH_SPECS["gpt2"])
+    except Exception as exc:
+        raise RuntimeError(
+            f"NNsight initialization failed for {model_name!r}; the manual engine was not run: {exc}"
+        ) from exc
+    return lm._model, tokenizer, nn_engine
+
+
+def engine_provenance(engine, model, *, model_name, dtype, device, band,
+                      nn_engine=None, revision=None):
+    """Stable E3/E4 provenance block used by configs and cache validation."""
+    if engine == "nnsight":
+        if nn_engine is None:
+            raise ValueError("NNsight provenance requires an initialized engine")
+        return nn_engine.engine_info(
+            model_name=model_name, revision=revision, dtype=dtype, device=device,
+            band=band, registry_version=E4_REGISTRY_VERSION)
+    return {
+        "name": "manual",
+        "nnsight_version": None,
+        "transformers_version": transformers.__version__,
+        "torch_version": torch.__version__,
+        "model_name": model_name,
+        "model_revision": revision or "main",
+        "dtype": dtype,
+        "device": str(device),
+        "remote": False,
+        "execution_location": "local",
+        "attn_implementation": "manual_reimplementation",
+        "attention_probability_source": "common.intervention_analysis.manual_self_attention_new",
+        "layer_band": [int(band[0]), int(band[1])],
+        "intervention_registry_version": E4_REGISTRY_VERSION,
+    }
 
 
 def compute_ppes(model, pos_enc):
@@ -243,6 +339,139 @@ def bos_metric(attn_weights, num_layers, target_pos=SINK_POS, band=None):
                                         target_pos=target_pos, layer_start=ls, layer_end=le)
 
 
+def _position_transform_for_spec(spec: ResidualInterventionSpec):
+    if spec.position_edit == "remove_first":
+        return _pe_remove_first
+    if spec.position_edit == "zero_first":
+        return _pe_zero_first
+    if spec.position_edit == "zero_all":
+        return lambda pe: torch.zeros_like(pe)
+    if spec.position_edit == "scale_first":
+        return _pe_scale_first(spec.position_alpha)
+    if spec.position_edit == "interp_first":
+        return _pe_interp_first(spec.position_alpha)
+    return None
+
+
+class ResidualExecutor:
+    """E4 execution seam with identical declarative specs for both engines."""
+
+    def __init__(self, model, engine="manual", nn_engine=None, massive_coords=()):
+        self.model = model
+        self.engine = engine
+        self.nn_engine = nn_engine
+        self.massive_coords = tuple(int(c) for c in massive_coords)
+        if engine == "nnsight" and nn_engine is None:
+            raise ValueError("engine='nnsight' requires an initialized NNsightEngine")
+
+    def _swap_dirs(self, spec: ResidualInterventionSpec, pe=None):
+        if spec.mlp_edit not in {"swap_epe", "swap_pe"}:
+            return None
+        with torch.no_grad():
+            if pe is None:
+                device = next(self.model.parameters()).device
+                positions = torch.arange(2, device=device).unsqueeze(0)
+                pe = self.model.transformer.wpe(positions)
+            transform = _position_transform_for_spec(spec)
+            pe_work = transform(pe.clone()) if transform else pe.clone()
+            vectors = (compute_ppes(self.model, pe_work)
+                       if spec.mlp_edit == "swap_epe" else pe_work[0])
+            u0 = vectors[0] / torch.linalg.vector_norm(vectors[0]).clamp_min(1e-9)
+            u1 = vectors[1] / torch.linalg.vector_norm(vectors[1]).clamp_min(1e-9)
+        return u0, u1
+
+    def _manual_kwargs(self, spec: ResidualInterventionSpec, pe):
+        attn_kwargs = {"query_bias_scale": spec.query_bias_scale}
+        if spec.wk_kind == "massive":
+            if spec.wk_scale == 0.0:
+                attn_kwargs["fixed_wk_zero_indices"] = list(self.massive_coords)
+            elif spec.wk_scale != 1.0:
+                attn_kwargs["wk_scale_indices"] = list(self.massive_coords)
+                attn_kwargs["wk_scale"] = spec.wk_scale
+        mlp_modify = None
+        if spec.mlp_edit in {"swap_epe", "swap_pe"}:
+            mlp_modify = make_swap_direction(*self._swap_dirs(spec, pe))
+        elif spec.mlp_edit == "zero_first":
+            mlp_modify = make_zero_layer0_mlp()
+        te_transform = None
+        if spec.token_edit == "zero_first":
+            def te_transform(te):
+                te[0, 0] = 0
+                return te
+        return {
+            "attn_kwargs": attn_kwargs,
+            "mlp_modify": mlp_modify,
+            "skip_mlp": spec.mlp_edit == "zero_all",
+            "pe_transform": _position_transform_for_spec(spec),
+            "te_transform": te_transform,
+        }
+
+    def prepare(self, input_ids):
+        """Cache manual embeddings once per example; NNsight needs no pre-forward."""
+        if self.engine != "manual":
+            return None
+        return get_initial_embeddings(self.model, {"input_ids": input_ids})
+
+    def execute(self, input_ids, spec: ResidualInterventionSpec, band, *,
+                attention="targets", target_positions=(SINK_POS,),
+                capture_qk=False, capture_block_outputs=(), capture_logits=False,
+                prepared=None):
+        """Execute ``spec`` once and return a common result dictionary."""
+        if self.engine == "manual":
+            pe, te = prepared if prepared is not None else self.prepare(input_ids)
+            kwargs = self._manual_kwargs(spec, pe)
+            result = {"attention": [], "target_attention": {}, "pre_ln": [], "qk": [],
+                      "block_outputs": {}, "logits": None, "band": band,
+                      "plan_key": spec.key, "attention_summary": {}}
+            if attention != "none":
+                weights = run_config(
+                    self.model, te, pe,
+                    scale_bq=spec.query_bias_scale,
+                    wk_zero_coords=(self.massive_coords if spec.wk_kind == "massive"
+                                    and spec.wk_scale == 0.0 else None),
+                    wk_scale_coords=(self.massive_coords if spec.wk_kind == "massive"
+                                     and spec.wk_scale not in (0.0, 1.0) else None),
+                    wk_scale=spec.wk_scale,
+                    mlp_modify=kwargs["mlp_modify"], skip_mlp=kwargs["skip_mlp"],
+                    pe_transform=kwargs["pe_transform"], te_transform=kwargs["te_transform"])
+                selected = [weights[i] for i in range(band[0], band[1])]
+                if attention == "full":
+                    result["attention"] = selected
+                start = input_ids.shape[-1] // 2
+                result["target_attention"] = {
+                    int(pos): torch.stack([
+                        layer[:, start:, int(pos)].mean(dim=1).detach().float().cpu()
+                        for layer in selected])
+                    for pos in target_positions
+                }
+            if capture_logits:
+                result["logits"] = forward_to_logits(
+                    self.model, te, pe, attn_kwargs=kwargs["attn_kwargs"],
+                    mlp_modify=kwargs["mlp_modify"], skip_mlp=kwargs["skip_mlp"],
+                    pe_transform=kwargs["pe_transform"], te_transform=kwargs["te_transform"])
+            return result
+
+        plan = _residual_plan(spec, self.massive_coords)
+        inputs = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
+        try:
+            return self.nn_engine.run_gpt2_trace(
+                plan, inputs, band=band, attention=attention,
+                target_positions=target_positions, capture_qk=capture_qk,
+                capture_block_outputs=capture_block_outputs,
+                capture_logits=capture_logits, swap_dirs=self._swap_dirs(spec))
+        except Exception as exc:
+            raise RuntimeError(
+                f"NNsight execution failed for E4 intervention {spec.key!r}; "
+                f"the manual engine was not run: {exc}") from exc
+
+
+def target_metric(result, target_pos=SINK_POS):
+    values = result["target_attention"].get(int(target_pos))
+    if values is None or values.numel() == 0:
+        raise ValueError(f"Trace did not capture target position {target_pos}")
+    return float(values.mean())
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Per-sentence forward that collects the score decomposition + query alignment (E4.2)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -373,6 +602,118 @@ def _decompose_layer(normalized, layer, ppes, H, Dh, scale, device, assert_ident
     }
 
 
+def collect_traced_decomposition_and_alignment(model, trace_result,
+                                                assert_identity=False):
+    """E4 decomposition from actual NNsight-captured pre-LN and Q/K projections.
+
+    The traced Hugging Face attention probabilities supply ``attn_full``.  T1/T2/T3/T4,
+    the component-only softmaxes, and the EPE-key alignment remain the experiment's
+    mathematical utilities, but their activation-dependent inputs are the real forward's
+    pre-LN states and fused projection outputs.  The identity is checked separately for
+    every selected layer and head.
+    """
+    band = tuple(trace_result["band"])
+    if len(trace_result["pre_ln"]) != band[1] - band[0] or \
+            len(trace_result["qk"]) != band[1] - band[0]:
+        raise ValueError("Trace result lacks the selected band's pre-LN/QK captures")
+    full_targets = trace_result["target_attention"].get(SINK_POS)
+    if full_targets is None or len(full_targets) != band[1] - band[0]:
+        raise ValueError("Trace result lacks per-head position-zero attention")
+
+    H = model.config.n_head
+    hidden = model.config.hidden_size
+    Dh = hidden // H
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        positions = torch.arange(trace_result["pre_ln"][0].shape[0], device=device).unsqueeze(0)
+        pe = model.transformer.wpe(positions)
+        ppes = compute_ppes(model, pe).detach().float().cpu()
+
+    out = {key: [] for key in
+           ("attn_full", "attn_content", "attn_delta", "share_delta",
+            "align_red", "align_blue")}
+    for offset, li in enumerate(range(band[0], band[1])):
+        normalized = trace_result["pre_ln"][offset].float()
+        projected = trace_result["qk"][offset].float()
+        seq = normalized.shape[0]
+        layer = model.transformer.h[li]
+        qkv_w = layer.attn.c_attn.weight.detach().t().float().cpu()
+        qkv_b = layer.attn.c_attn.bias.detach().float().cpu()
+        _wq, wk, _wv = qkv_w.chunk(3, dim=0)
+        bq, bk, _bv = qkv_b.chunk(3, dim=0)
+
+        if assert_identity:
+            projected_from_pre_ln = F.linear(
+                normalized, qkv_w[:2 * hidden], qkv_b[:2 * hidden])
+            projection_error = float((projected_from_pre_ln - projected).abs().max())
+            projection_scale = float(projected.abs().max())
+            projection_tol = 1e-3 + 1e-4 * projection_scale
+            if projection_error >= projection_tol:
+                raise AssertionError(
+                    f"captured Q/K projection mismatch at layer {li}: "
+                    f"error={projection_error:.6g}, tolerance={projection_tol:.6g}")
+
+        q_full = projected[:, :hidden].view(seq, H, Dh)
+        k_full = projected[:, hidden:2 * hidden].view(seq, H, Dh)
+        q_c = q_full - bq.view(1, H, Dh)
+        k_c = k_full - bk.view(1, H, Dh)
+        bq_h = bq.view(H, Dh)
+        bk_h = bk.view(H, Dh)
+
+        T1 = torch.einsum("ihd,jhd->hij", q_c, k_c)
+        T2 = torch.einsum("ihd,hd->hi", q_c, bk_h)
+        T3 = torch.einsum("hd,jhd->hj", bq_h, k_c)
+        T4 = torch.einsum("hd,hd->h", bq_h, bk_h)
+        reconstructed = T1 + T2.unsqueeze(2) + T3.unsqueeze(1) + T4.view(H, 1, 1)
+        reference = torch.einsum("ihd,jhd->hij", q_full, k_full)
+        if assert_identity:
+            per_head_error = (reconstructed - reference).abs().flatten(1).max(dim=1).values
+            per_head_scale = reference.abs().flatten(1).max(dim=1).values
+            tolerance = 1e-3 + 1e-4 * per_head_scale
+            failed = torch.where(per_head_error >= tolerance)[0]
+            if failed.numel():
+                head = int(failed[0])
+                raise AssertionError(
+                    f"score decomposition identity failed at layer {li}, head {head}: "
+                    f"error={float(per_head_error[head]):.6g}, "
+                    f"tolerance={float(tolerance[head]):.6g}")
+
+        score_scale = 1.0
+        if getattr(layer.attn, "scale_attn_weights", True):
+            score_scale /= np.sqrt(Dh)
+        if getattr(layer.attn, "scale_attn_by_inverse_layer_idx", False):
+            score_scale /= (li + 1)
+        mask = torch.tril(torch.ones(seq, seq, dtype=torch.bool))
+
+        def target_attention(scores):
+            masked = (scores * score_scale).masked_fill(~mask.unsqueeze(0), float("-inf"))
+            return torch.softmax(masked, dim=-1)[:, seq // 2:, SINK_POS].mean(dim=1)
+
+        effective = T1 + T3.unsqueeze(1)
+        delta_full = T3.unsqueeze(1).expand(H, seq, seq)
+        a_content = target_attention(T1)
+        a_delta = target_attention(delta_full)
+        counts = torch.arange(1, seq + 1).float()
+        eff_mean = effective.masked_fill(~mask.unsqueeze(0), 0.0).sum(dim=-1) / counts
+        adv_full = effective[:, :, SINK_POS] - eff_mean
+        t3_mean = torch.cumsum(T3, dim=-1) / counts
+        adv_delta = T3[:, SINK_POS:SINK_POS + 1] - t3_mean
+        share = (adv_delta / (adv_full + 1e-9))[:, seq // 2:].mean(dim=1)
+
+        epe_keys = (ppes @ wk.t()).view(seq, H, Dh)
+        q_norm = q_c / q_c.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        key_norm = epe_keys / epe_keys.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        cosine = torch.einsum("ihd,phd->iph", q_norm[seq // 2:], key_norm)
+
+        out["attn_full"].append(full_targets[offset].numpy())
+        out["attn_content"].append(a_content.numpy())
+        out["attn_delta"].append(a_delta.numpy())
+        out["share_delta"].append(share.numpy())
+        out["align_red"].append(cosine[:, SINK_POS, :].mean(dim=0).numpy())
+        out["align_blue"].append(cosine[:, SINK_POS + 1:, :].mean(dim=(0, 1)).numpy())
+    return {key: np.stack(values, axis=0) for key, values in out.items()}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Perplexity forward-to-logits (E4.6, optional)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -419,12 +760,18 @@ def sequence_cross_entropy(logits, input_ids):
 
 def iter_examples(model, tokenizer, sampled):
     """Yield (dataset_name, input_ids, token_embeddings, pos_enc) for every sampled example."""
+    for ds_name, input_ids in iter_token_ids(model, tokenizer, sampled):
+        pos_enc, token_embeddings = get_initial_embeddings(model, {"input_ids": input_ids})
+        yield ds_name, input_ids, token_embeddings, pos_enc
+
+
+def iter_token_ids(model, tokenizer, sampled):
+    """Yield the exact token IDs without running a preliminary model forward."""
     for ds_name, sentences in sampled.items():
         for sentence in sentences:
             inputs = tokenizer(sentence, return_tensors="pt", add_special_tokens=False)
             inputs = inputs.to(model.device)
-            pos_enc, token_embeddings = get_initial_embeddings(model, inputs)
-            yield ds_name, inputs["input_ids"], token_embeddings, pos_enc
+            yield ds_name, inputs["input_ids"]
 
 
 def count_examples(sampled):
@@ -435,7 +782,24 @@ def count_examples(sampled):
 # E4.1 — Dose-response
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=None):
+def _dose_specs(alphas):
+    specs = {}
+    for alpha in alphas:
+        specs[("scale_bq", alpha)] = ResidualInterventionSpec(
+            f"scale_bq_{alpha:g}", query_bias_scale=float(alpha))
+        specs[("scale_pe", alpha)] = ResidualInterventionSpec(
+            f"scale_pe_{alpha:g}", position_edit="scale_first",
+            position_alpha=float(alpha))
+        specs[("interp_pe", alpha)] = ResidualInterventionSpec(
+            f"interp_pe_{alpha:g}", position_edit="interp_first",
+            position_alpha=float(alpha))
+        specs[("scale_wk_massive", alpha)] = ResidualInterventionSpec(
+            f"scale_wk_massive_{alpha:g}", wk_kind="massive", wk_scale=float(alpha))
+    return specs
+
+
+def run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=None,
+                      executor=None):
     """BOS-attention vs α for three knobs. Returns a tidy DataFrame (one row per α×knob).
 
     Knobs are driven at an *effective* locus (see the module header on why layer-0-only
@@ -450,22 +814,19 @@ def run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=No
     num_layers = len(model.transformer.h)
     knobs = ["scale_bq", "scale_pe", "interp_pe", "scale_wk_massive"]
     acc = {(k, a): [] for k in knobs for a in alphas}
+    specs = _dose_specs(alphas)
+    executor = executor or ResidualExecutor(model, "manual", massive_coords=massive_coords)
 
-    for _ds, _ids, te, pe in tqdm(
-        iter_examples(model, tokenizer, sampled),
+    for _ds, ids in tqdm(
+        iter_token_ids(model, tokenizer, sampled),
         total=count_examples(sampled),
         desc="dose_response examples",
     ):
-        for a in alphas:
-            acc[("scale_bq", a)].append(
-                bos_metric(run_config(model, te, pe, scale_bq=a), num_layers, band=band))
-            acc[("scale_pe", a)].append(
-                bos_metric(run_config(model, te, pe, pe_transform=_pe_scale_first(a)), num_layers, band=band))
-            acc[("interp_pe", a)].append(
-                bos_metric(run_config(model, te, pe, pe_transform=_pe_interp_first(a)), num_layers, band=band))
-            acc[("scale_wk_massive", a)].append(
-                bos_metric(run_config(model, te, pe,
-                                      wk_scale_coords=massive_coords, wk_scale=a), num_layers, band=band))
+        prepared = executor.prepare(ids)
+        for key, spec in specs.items():
+            result = executor.execute(ids, spec, band, attention="targets",
+                                      target_positions=(SINK_POS,), prepared=prepared)
+            acc[key].append(target_metric(result, SINK_POS))
 
     rows = []
     for (knob, a), vals in acc.items():
@@ -479,19 +840,30 @@ def run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=No
 # E4.2 — Decomposition + query alignment
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_decomposition(model, tokenizer, sampled, assert_identity=False, band=None):
+def run_decomposition(model, tokenizer, sampled, assert_identity=False, band=None,
+                      executor=None):
     """Aggregate the per-(layer,head) decomposition and alignment across all examples."""
     per_example = {k: [] for k in
                    ("attn_full", "attn_content", "attn_delta", "share_delta", "align_red", "align_blue")}
     ls, le = band if band is not None else (LAYER_RANGE_START, LAYER_RANGE_END)
     first = assert_identity
-    for _ds, _ids, te, pe in tqdm(
-        iter_examples(model, tokenizer, sampled),
+    executor = executor or ResidualExecutor(model, "manual")
+    baseline = ResidualInterventionSpec("baseline")
+    for _ds, ids in tqdm(
+        iter_token_ids(model, tokenizer, sampled),
         total=count_examples(sampled),
         desc="decomposition examples",
     ):
-        stats = collect_decomposition_and_alignment(model, te, pe, layer_start=ls, layer_end=le,
-                                                    assert_identity=first)
+        if executor.engine == "manual":
+            pe, te = executor.prepare(ids)
+            stats = collect_decomposition_and_alignment(
+                model, te, pe, layer_start=ls, layer_end=le, assert_identity=first)
+        else:
+            traced = executor.execute(
+                ids, baseline, (ls, le), attention="targets",
+                target_positions=(SINK_POS,), capture_qk=True)
+            stats = collect_traced_decomposition_and_alignment(
+                model, traced, assert_identity=first)
         first = False  # assert once is enough
         for k in per_example:
             per_example[k].append(stats[k])
@@ -505,53 +877,53 @@ def run_decomposition(model, tokenizer, sampled, assert_identity=False, band=Non
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _combined_and_surgical_specs(model, massive_coords):
-    """Return {name: builder(te, pe) -> attn_weights}. Builders close over the model.
+    """Return the named declarative E4.3/E4.4 intervention registry.
 
     The ``zero_topk_wk`` interventions zero ALL identified massive-activation columns
     of W_k, so k = len(massive_coords) — 3 for GPT-2 small (coords 138/378/447, matching
     the paper's Zero-Top-3-Wk), but model-dependent in general (e.g. 6 for gpt2-medium).
     The per-run k and coordinate list are recorded in run_config.json.
     """
-    def epe_hats(pe):
-        ppes = compute_ppes(model, pe)
-        return (ppes[0] / torch.linalg.norm(ppes[0]), ppes[1] / torch.linalg.norm(ppes[1]))
-
-    specs = {}
-    # references
-    specs["baseline"] = lambda te, pe: run_config(model, te, pe)
-    specs["nullify_bq"] = lambda te, pe: run_config(model, te, pe, nullify_bq=True)
-    # E4.3 combined
-    specs["bq0__remove_first_pe"] = lambda te, pe: run_config(
-        model, te, pe, nullify_bq=True, pe_transform=_pe_remove_first)
-    specs["bq0__zero_topk_wk"] = lambda te, pe: run_config(
-        model, te, pe, nullify_bq=True, wk_zero_coords=massive_coords)
-    specs["bq0__swap_epe"] = lambda te, pe: run_config(
-        model, te, pe, nullify_bq=True, mlp_modify=make_swap_direction(*epe_hats(pe)))
-    specs["bq0__zero_topk_wk__swap_epe"] = lambda te, pe: run_config(
-        model, te, pe, nullify_bq=True, wk_zero_coords=massive_coords,
-        mlp_modify=make_swap_direction(*epe_hats(pe)))
-    # E4.4 surgical vs. coarse
-    specs["first_layer_mlp_skip"] = lambda te, pe: run_config(
-        model, te, pe, mlp_modify=make_zero_layer0_mlp())
-    specs["all_layer_no_mlp"] = lambda te, pe: run_config(model, te, pe, skip_mlp=True)
-    specs["pos1_only_pe_zero"] = lambda te, pe: run_config(
-        model, te, pe, pe_transform=_pe_zero_first)
-    specs["all_pos_no_pe"] = lambda te, pe: run_config(
-        model, te, pe, pe_transform=lambda pe_: torch.zeros_like(pe_))
-    return specs
+    return {
+        "baseline": ResidualInterventionSpec("baseline"),
+        "nullify_bq": ResidualInterventionSpec("nullify_bq", query_bias_scale=0.0),
+        "bq0__remove_first_pe": ResidualInterventionSpec(
+            "bq0__remove_first_pe", query_bias_scale=0.0, position_edit="remove_first"),
+        "bq0__zero_topk_wk": ResidualInterventionSpec(
+            "bq0__zero_topk_wk", query_bias_scale=0.0,
+            wk_kind="massive", wk_scale=0.0),
+        "bq0__swap_epe": ResidualInterventionSpec(
+            "bq0__swap_epe", query_bias_scale=0.0, mlp_edit="swap_epe"),
+        "bq0__zero_topk_wk__swap_epe": ResidualInterventionSpec(
+            "bq0__zero_topk_wk__swap_epe", query_bias_scale=0.0,
+            wk_kind="massive", wk_scale=0.0, mlp_edit="swap_epe"),
+        "first_layer_mlp_skip": ResidualInterventionSpec(
+            "first_layer_mlp_skip", mlp_edit="zero_first"),
+        "all_layer_no_mlp": ResidualInterventionSpec(
+            "all_layer_no_mlp", mlp_edit="zero_all"),
+        "pos1_only_pe_zero": ResidualInterventionSpec(
+            "pos1_only_pe_zero", position_edit="zero_first"),
+        "all_pos_no_pe": ResidualInterventionSpec(
+            "all_pos_no_pe", position_edit="zero_all"),
+    }
 
 
-def run_intervention_set(model, tokenizer, sampled, names, specs, band=None):
+def run_intervention_set(model, tokenizer, sampled, names, specs, band=None,
+                         executor=None):
     """Run a named set of interventions, returning per-name BOS-attention (% of baseline)."""
     num_layers = len(model.transformer.h)
     acc = {n: [] for n in names}
-    for _ds, _ids, te, pe in tqdm(
-        iter_examples(model, tokenizer, sampled),
+    executor = executor or ResidualExecutor(model, "manual")
+    for _ds, ids in tqdm(
+        iter_token_ids(model, tokenizer, sampled),
         total=count_examples(sampled),
         desc="intervention examples",
     ):
+        prepared = executor.prepare(ids)
         for n in names:
-            acc[n].append(bos_metric(specs[n](te, pe), num_layers, band=band))
+            result = executor.execute(ids, specs[n], band, attention="targets",
+                                      target_positions=(SINK_POS,), prepared=prepared)
+            acc[n].append(target_metric(result, SINK_POS))
     means = {n: float(np.mean(v)) for n, v in acc.items()}
     base = means.get("baseline", 1.0) or 1.0
     return pd.DataFrame([
@@ -564,27 +936,36 @@ def run_intervention_set(model, tokenizer, sampled, names, specs, band=None):
 # E4.5 — Relocation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_relocation(model, tokenizer, sampled, band=None):
+def run_relocation(model, tokenizer, sampled, band=None, executor=None):
     """Attention to position 0 (sink) and position 1 (swap target) under Swap-EPE and b∧d."""
     num_layers = len(model.transformer.h)
     acc = {k: [] for k in ("base_pos0", "base_pos1",
                            "swap_pos0", "swap_pos1", "bq0swap_pos0", "bq0swap_pos1")}
-    for _ds, _ids, te, pe in tqdm(
-        iter_examples(model, tokenizer, sampled),
+    executor = executor or ResidualExecutor(model, "manual")
+    specs = {
+        "base": ResidualInterventionSpec("baseline"),
+        "swap": ResidualInterventionSpec("swap_epe", mlp_edit="swap_epe"),
+        "bq0swap": ResidualInterventionSpec(
+            "bq0__swap_epe", query_bias_scale=0.0, mlp_edit="swap_epe"),
+    }
+    for _ds, ids in tqdm(
+        iter_token_ids(model, tokenizer, sampled),
         total=count_examples(sampled),
         desc="relocation examples",
     ):
-        ppes = compute_ppes(model, pe)
-        hats = (ppes[0] / torch.linalg.norm(ppes[0]), ppes[1] / torch.linalg.norm(ppes[1]))
-        base = run_config(model, te, pe)
-        swap = run_config(model, te, pe, mlp_modify=make_swap_direction(*hats))
-        bq0swap = run_config(model, te, pe, nullify_bq=True, mlp_modify=make_swap_direction(*hats))
-        acc["base_pos0"].append(bos_metric(base, num_layers, SINK_POS, band=band))
-        acc["base_pos1"].append(bos_metric(base, num_layers, RELOCATION_POS, band=band))
-        acc["swap_pos0"].append(bos_metric(swap, num_layers, SINK_POS, band=band))
-        acc["swap_pos1"].append(bos_metric(swap, num_layers, RELOCATION_POS, band=band))
-        acc["bq0swap_pos0"].append(bos_metric(bq0swap, num_layers, SINK_POS, band=band))
-        acc["bq0swap_pos1"].append(bos_metric(bq0swap, num_layers, RELOCATION_POS, band=band))
+        prepared = executor.prepare(ids)
+        results = {
+            name: executor.execute(
+                ids, spec, band, attention="targets",
+                target_positions=(SINK_POS, RELOCATION_POS), prepared=prepared)
+            for name, spec in specs.items()
+        }
+        acc["base_pos0"].append(target_metric(results["base"], SINK_POS))
+        acc["base_pos1"].append(target_metric(results["base"], RELOCATION_POS))
+        acc["swap_pos0"].append(target_metric(results["swap"], SINK_POS))
+        acc["swap_pos1"].append(target_metric(results["swap"], RELOCATION_POS))
+        acc["bq0swap_pos0"].append(target_metric(results["bq0swap"], SINK_POS))
+        acc["bq0swap_pos1"].append(target_metric(results["bq0swap"], RELOCATION_POS))
     means = {k: float(np.mean(v)) for k, v in acc.items()}
     means["relocation_ratio_swap"] = (
         (means["swap_pos1"] - means["base_pos1"]) / (means["base_pos0"] + 1e-9))
@@ -595,33 +976,43 @@ def run_relocation(model, tokenizer, sampled, band=None):
 # E4.6 — Perplexity (optional)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_perplexity(model, tokenizer, sampled, massive_coords):
+def run_perplexity(model, tokenizer, sampled, massive_coords, executor=None):
     """LM cross-entropy under each pathway ablation (and an HF baseline sanity check).
 
     ``zero_topk_wk`` zeroes all k = len(massive_coords) massive W_k columns (k and the
     coordinate list are recorded in run_config.json).
     """
-    configs = {
-        "baseline": dict(),
-        "nullify_bq": dict(attn_kwargs={"intervene_query_bias": True}),
-        "zero_topk_wk": dict(attn_kwargs={"fixed_wk_zero_indices": list(massive_coords)}),
-        "first_layer_mlp_skip": dict(mlp_modify=make_zero_layer0_mlp()),
+    specs = {
+        "baseline": ResidualInterventionSpec("baseline"),
+        "nullify_bq": ResidualInterventionSpec("nullify_bq", query_bias_scale=0.0),
+        "zero_topk_wk": ResidualInterventionSpec(
+            "zero_topk_wk", wk_kind="massive", wk_scale=0.0),
+        "first_layer_mlp_skip": ResidualInterventionSpec(
+            "first_layer_mlp_skip", mlp_edit="zero_first"),
     }
-    acc = {n: [] for n in configs}
+    executor = executor or ResidualExecutor(model, "manual", massive_coords=massive_coords)
+    acc = {n: [] for n in specs}
     acc_hf = []
-    for _ds, ids, te, pe in tqdm(
-        iter_examples(model, tokenizer, sampled),
+    for _ds, ids in tqdm(
+        iter_token_ids(model, tokenizer, sampled),
         total=count_examples(sampled),
         desc="perplexity examples",
     ):
-        with torch.no_grad():
-            hf_logits = model(input_ids=ids).logits
-        acc_hf.append(sequence_cross_entropy(hf_logits, ids))
-        for n, cfg in configs.items():
-            logits = forward_to_logits(model, te, pe, **cfg)
-            acc[n].append(sequence_cross_entropy(logits, ids))
+        prepared = executor.prepare(ids)
+        if executor.engine == "manual":
+            with torch.no_grad():
+                hf_logits = model(input_ids=ids).logits
+            acc_hf.append(sequence_cross_entropy(hf_logits, ids))
+        for n, spec in specs.items():
+            result = executor.execute(ids, spec, (0, len(model.transformer.h)),
+                                      attention="none", capture_logits=True,
+                                      prepared=prepared)
+            acc[n].append(sequence_cross_entropy(result["logits"], ids.cpu()
+                                                  if result["logits"].device.type == "cpu" else ids))
+            if executor.engine == "nnsight" and n == "baseline":
+                acc_hf.append(acc[n][-1])
     rows = [{"intervention": "hf_reference", "cross_entropy": float(np.mean(acc_hf))}]
-    for n in configs:
+    for n in specs:
         rows.append({"intervention": n, "cross_entropy": float(np.mean(acc[n]))})
     return pd.DataFrame(rows)
 
@@ -705,33 +1096,40 @@ def _seed_dir(root, seed):
     return root / f"seed_{seed:03d}"
 
 
-def run_all_modes(model, tokenizer, sampled, modes, alphas, massive_coords, with_perplexity, band=None):
+def run_all_modes(model, tokenizer, sampled, modes, alphas, massive_coords, with_perplexity,
+                  band=None, executor=None):
     """Run the requested modes for one seed; return a dict of results (DataFrames / arrays)."""
     res = {}
     if "dose_response" in modes:
         print("Running mode: dose_response")
-        res["dose_response"] = run_dose_response(model, tokenizer, sampled, alphas, massive_coords, band=band)
+        res["dose_response"] = run_dose_response(
+            model, tokenizer, sampled, alphas, massive_coords, band=band, executor=executor)
     if "decomposition" in modes:
         print("Running mode: decomposition")
-        res["decomposition"] = run_decomposition(model, tokenizer, sampled, assert_identity=True, band=band)
+        res["decomposition"] = run_decomposition(
+            model, tokenizer, sampled, assert_identity=True, band=band, executor=executor)
     if "combined" in modes or "surgical" in modes:
         specs = _combined_and_surgical_specs(model, massive_coords)
         if "combined" in modes:
             print("Running mode: combined")
             names = ["baseline", "nullify_bq", "bq0__remove_first_pe", "bq0__zero_topk_wk",
                      "bq0__swap_epe", "bq0__zero_topk_wk__swap_epe"]
-            res["combined"] = run_intervention_set(model, tokenizer, sampled, names, specs, band=band)
+            res["combined"] = run_intervention_set(
+                model, tokenizer, sampled, names, specs, band=band, executor=executor)
         if "surgical" in modes:
             print("Running mode: surgical")
             names = ["baseline", "first_layer_mlp_skip", "all_layer_no_mlp",
                      "pos1_only_pe_zero", "all_pos_no_pe"]
-            res["surgical"] = run_intervention_set(model, tokenizer, sampled, names, specs, band=band)
+            res["surgical"] = run_intervention_set(
+                model, tokenizer, sampled, names, specs, band=band, executor=executor)
     if "relocation" in modes:
         print("Running mode: relocation")
-        res["relocation"] = run_relocation(model, tokenizer, sampled, band=band)
+        res["relocation"] = run_relocation(
+            model, tokenizer, sampled, band=band, executor=executor)
     if with_perplexity or "perplexity" in modes:
         print("Running mode: perplexity")
-        res["perplexity"] = run_perplexity(model, tokenizer, sampled, massive_coords)
+        res["perplexity"] = run_perplexity(
+            model, tokenizer, sampled, massive_coords, executor=executor)
     return res
 
 
@@ -836,6 +1234,100 @@ def _decomposition_summary(cells):
     ])
 
 
+def _requested_config_modes(modes, with_perplexity):
+    out = list(modes)
+    if with_perplexity and "perplexity" not in out:
+        out.append("perplexity")
+    return out
+
+
+def _critical_e4_config(args, seed):
+    return {
+        "registry_version": E4_REGISTRY_VERSION,
+        "trace_registry_version": GPT2_TRACE_REGISTRY_VERSION,
+        "engine_name": args.engine,
+        "model_name": args.model_name,
+        "model_revision": args.revision or "main",
+        "dtype": args.dtype,
+        "layer_mode": args.layer_mode,
+        "seed": int(seed),
+        "sample_size": int(args.sample_size),
+        "cut_length": int(args.cut_length),
+        "alphas": [float(a) for a in args._parsed_alphas],
+    }
+
+
+def _validate_e4_config(path, requested, *, write=False, extra=None):
+    if path.exists():
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        mismatch = {key: (cached.get(key), value) for key, value in requested.items()
+                    if cached.get(key) != value}
+        if mismatch:
+            detail = ", ".join(
+                f"{key}: cached={old!r}, requested={new!r}"
+                for key, (old, new) in mismatch.items())
+            raise ValueError(f"Incompatible E4 cache at {path}: {detail}")
+    elif not write:
+        raise FileNotFoundError(
+            f"Missing E4 cache metadata {path}; legacy caches without engine metadata "
+            "cannot be mixed with a requested engine")
+    if write:
+        path.write_text(json.dumps({**requested, **(extra or {})}, indent=2,
+                                   sort_keys=True), encoding="utf-8")
+
+
+def _parity_row(quantity, manual, nnsight, atol, rtol):
+    manual_arr = np.asarray(manual, dtype=float)
+    nnsight_arr = np.asarray(nnsight, dtype=float)
+    abs_diff = float(np.max(np.abs(manual_arr - nnsight_arr)))
+    scale = float(np.max(np.abs(nnsight_arr)))
+    rel_diff = abs_diff / max(scale, 1e-12)
+    passed = bool(abs_diff <= atol + rtol * scale)
+    return {"quantity": quantity, "manual": float(np.mean(manual_arr)),
+            "nnsight_reference": float(np.mean(nnsight_arr)),
+            "max_abs_difference": abs_diff, "max_relative_difference": rel_diff,
+            "atol": atol, "rtol": rtol, "status": "pass" if passed else "fail"}
+
+
+def verify_e4_parity(model, tokenizer, sampled, alphas, massive_coords, band,
+                     nn_engine, *, atol=1e-5, rtol=1e-4):
+    """Compare every E4 mode, treating the real traced HF forward as reference."""
+    manual = ResidualExecutor(model, "manual", massive_coords=massive_coords)
+    traced = ResidualExecutor(model, "nnsight", nn_engine, massive_coords)
+    modes = list(ALL_MODES)
+    manual_out = run_all_modes(model, tokenizer, sampled, modes, alphas, massive_coords,
+                               True, band=band, executor=manual)
+    traced_out = run_all_modes(model, tokenizer, sampled, modes, alphas, massive_coords,
+                               True, band=band, executor=traced)
+    rows = []
+    for key in ("dose_response", "combined", "surgical", "perplexity"):
+        left, right = manual_out[key], traced_out[key]
+        id_cols = (["knob", "alpha"] if key == "dose_response" else ["intervention"])
+        value_cols = (["bos_attention"] if key == "dose_response" else
+                      (["cross_entropy"] if key == "perplexity" else
+                       ["bos_attention", "pct_base"]))
+        merged = left.merge(right, on=id_cols, suffixes=("_manual", "_nnsight"))
+        for _, row in merged.iterrows():
+            identity = "/".join(str(row[col]) for col in id_cols)
+            for value in value_cols:
+                rows.append(_parity_row(
+                    f"{key}/{identity}/{value}", row[f"{value}_manual"],
+                    row[f"{value}_nnsight"], atol, rtol))
+    for key in manual_out["decomposition"]:
+        rows.append(_parity_row(
+            f"decomposition/{key}", manual_out["decomposition"][key],
+            traced_out["decomposition"][key], atol, rtol))
+    for key in manual_out["relocation"]:
+        rows.append(_parity_row(
+            f"relocation/{key}", manual_out["relocation"][key],
+            traced_out["relocation"][key], atol, rtol))
+    return {
+        "reference": "NNsight real Hugging Face forward",
+        "atol": atol, "rtol": rtol, "rows": rows,
+        "all_rows_pass": all(row["status"] == "pass" for row in rows),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -852,6 +1344,8 @@ def main():
                         choices=ALL_MODES + ["perplexity", "all"],
                         help="Which analysis to run (default: all = the five core analyses).")
     parser.add_argument("--model-name", "--model", dest="model_name", default="gpt2")
+    parser.add_argument("--revision", default=None,
+                        help="Optional Hugging Face model revision (default: main).")
     parser.add_argument("--output-dir", default="results")
     parser.add_argument("--experiment-name", default=None,
                         help="Subdir under --output-dir. Default: residual_sink_<model tag>.")
@@ -868,14 +1362,23 @@ def main():
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32",
                         help="Model dtype. Default float32 (matches the paper's SEs); use a smaller "
                              "dtype only if VRAM-constrained on large XL runs.")
+    parser.add_argument("--engine", choices=["manual", "nnsight"], default="manual",
+                        help="Execution engine. Manual remains the reproduction default; "
+                             "nnsight uses the real eager Hugging Face forward.")
     parser.add_argument("--with-perplexity", action="store_true",
                         help="Also compute the optional E4.6 LM-loss table.")
     parser.add_argument("--plot-only", action="store_true",
                         help="Skip computation; only aggregate + plot existing per-seed outputs.")
+    parser.add_argument("--verify-parity", action="store_true",
+                        help="Compare manual and NNsight outputs for every E4 mode, write "
+                             "parity_report.json, and exit.")
+    parser.add_argument("--parity-atol", type=float, default=1e-5)
+    parser.add_argument("--parity-rtol", type=float, default=1e-4)
     args = parser.parse_args()
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip() != ""]
     alphas = ([float(a) for a in args.alphas.split(",")] if args.alphas else DEFAULT_ALPHAS)
+    args._parsed_alphas = alphas
     modes = ALL_MODES if args.mode == "all" else [args.mode]
 
     tag = args.model_name.replace("/", "_")
@@ -883,41 +1386,95 @@ def main():
     root = Path(args.output_dir) / exp
     root.mkdir(parents=True, exist_ok=True)
 
-    if not args.plot_only:
-        dtype = {"float32": torch.float32, "float16": torch.float16,
-                 "bfloat16": torch.bfloat16}[args.dtype]
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Loading {args.model_name} on {device} (dtype {args.dtype}) ...")
-        model, tokenizer = load_model(args.model_name, device, dtype=dtype)
-        num_layers = len(model.transformer.h)
-        band = compute_band(num_layers, args.layer_mode)
-        massive_coords = identify_massive_coords(model, device)
-        print(f"Layers: {num_layers}  |  mid-band [{band[0]}, {band[1]})  |  layer-mode {args.layer_mode}")
-        print(f"Massive-activation coordinates of EPE_1: {massive_coords}")
-
-        run_meta = {
-            "model_name": args.model_name, "dtype": args.dtype, "layer_mode": args.layer_mode,
-            "band_start": band[0], "band_end": band[1], "num_layers": num_layers,
-            "massive_coords": massive_coords, "alphas": alphas,
-            "sample_size": args.sample_size, "cut_length": args.cut_length,
-        }
-
+    config_modes = _requested_config_modes(modes, args.with_perplexity)
+    if args.plot_only:
+        if args.verify_parity:
+            parser.error("--plot-only and --verify-parity are mutually exclusive")
         for seed in seeds:
-            print(f"\n{'='*70}\nSeed {seed}: sampling + running modes {modes}\n{'='*70}")
-            sampled, manifest = sample_benchmark_datasets(
-                tokenizer, sample_size=args.sample_size,
-                cut_length=args.cut_length, seed=seed)
-            out_dir = _seed_dir(root, seed)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(manifest).to_csv(out_dir / "sample_manifest.csv", index=False)
-            (out_dir / "run_config.json").write_text(json.dumps({**run_meta, "seed": seed}, indent=2))
-            res = run_all_modes(model, tokenizer, sampled, modes, alphas,
-                                massive_coords, args.with_perplexity, band=band)
-            save_seed_results(res, out_dir)
-            print(f"Seed {seed} outputs → {out_dir}")
+            requested = _critical_e4_config(args, seed)
+            for mode in config_modes:
+                _validate_e4_config(
+                    _seed_dir(root, seed) / f"run_config_{mode}.json",
+                    requested, write=False)
+        agg = aggregate_and_plot(root, seeds, modes, alphas, args.with_perplexity)
+        print(f"Plots and aggregate tables regenerated from cache: {agg}")
+        return
+
+    dtype = {"float32": torch.float32, "float16": torch.float16,
+             "bfloat16": torch.bfloat16}[args.dtype]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading {args.model_name} on {device} (dtype {args.dtype}, engine {args.engine}) ...")
+    load_engine = "nnsight" if args.verify_parity else args.engine
+    try:
+        model, tokenizer, nn_engine = load_model_for_engine(
+            args.model_name, device, dtype=dtype, engine=load_engine,
+            revision=args.revision)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unable to initialize requested E4 engine {args.engine!r}: {exc}") from exc
+    num_layers = len(model.transformer.h)
+    band = compute_band(num_layers, args.layer_mode)
+    massive_coords = identify_massive_coords(model, device)
+    executor = ResidualExecutor(model, args.engine, nn_engine, massive_coords)
+    provenance = engine_provenance(
+        args.engine, model, model_name=args.model_name, dtype=args.dtype,
+        device=device, band=band, nn_engine=nn_engine, revision=args.revision)
+    print(f"Layers: {num_layers}  |  mid-band [{band[0]}, {band[1]})  |  layer-mode {args.layer_mode}")
+    print(f"Massive-activation coordinates of EPE_1: {massive_coords}")
+
+    if args.verify_parity:
+        seed = seeds[0] if seeds else 0
+        sampled, _manifest = sample_benchmark_datasets(
+            tokenizer, sample_size=args.sample_size,
+            cut_length=args.cut_length, seed=seed)
+        report = verify_e4_parity(
+            model, tokenizer, sampled, alphas, massive_coords, band, nn_engine,
+            atol=args.parity_atol, rtol=args.parity_rtol)
+        (root / "parity_report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8")
+        if not report["all_rows_pass"]:
+            raise AssertionError(
+                "E4 manual/NNsight parity differences exceeded tolerance; "
+                "the NNsight Hugging Face forward is the reference. See parity_report.json.")
+        print(f"Parity report written to {root / 'parity_report.json'}")
+        return
+
+    run_meta = {
+        "registry_version": E4_REGISTRY_VERSION,
+        "trace_registry_version": GPT2_TRACE_REGISTRY_VERSION,
+        "engine_name": args.engine,
+        "engine": provenance,
+        "model_name": args.model_name, "model_revision": args.revision or "main",
+        "dtype": args.dtype, "layer_mode": args.layer_mode,
+        "band_start": band[0], "band_end": band[1], "num_layers": num_layers,
+        "massive_coords": massive_coords, "alphas": alphas,
+        "sample_size": args.sample_size, "cut_length": args.cut_length,
+    }
+
+    for seed in seeds:
+        print(f"\n{'='*70}\nSeed {seed}: sampling + running modes {modes}\n{'='*70}")
+        sampled, manifest = sample_benchmark_datasets(
+            tokenizer, sample_size=args.sample_size,
+            cut_length=args.cut_length, seed=seed)
+        out_dir = _seed_dir(root, seed)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        requested = _critical_e4_config(args, seed)
+        for mode in config_modes:
+            _validate_e4_config(
+                out_dir / f"run_config_{mode}.json", requested,
+                write=True, extra={**run_meta, "seed": seed, "mode": mode})
+        pd.DataFrame(manifest).to_csv(out_dir / "sample_manifest.csv", index=False)
+        (out_dir / "run_config.json").write_text(
+            json.dumps({**run_meta, "seed": seed, "modes": config_modes}, indent=2,
+                       sort_keys=True), encoding="utf-8")
+        res = run_all_modes(model, tokenizer, sampled, modes, alphas,
+                            massive_coords, args.with_perplexity, band=band,
+                            executor=executor)
+        save_seed_results(res, out_dir)
+        print(f"Seed {seed} outputs: {out_dir}")
 
     agg = aggregate_and_plot(root, seeds, modes, alphas, args.with_perplexity)
-    print(f"\nDone. Aggregated results + figures → {agg}")
+    print(f"\nDone. Aggregated results + figures: {agg}")
 
 
 if __name__ == "__main__":
