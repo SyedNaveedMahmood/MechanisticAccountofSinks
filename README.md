@@ -111,6 +111,11 @@ python ../common/experiments_single_input.py --mode massive-activations --output
 Output:
 - `results/massive_activations/massive_activations_in_ppe.png` → **Fig 7**
 
+The forward-dependent Figure 1 and Figure 3 statistical paths also accept
+`--engine {manual,nnsight}` (default `manual`). Figure 2, Figure 4/8, and Figure 7 are
+pure weight-space calculations; Figure 5 and Table 1 already use the shared E1/E2 engine.
+See the [E3/E4/E5 NNsight implementation guide](docs/NNsight_E3_E4_E5_IMPLEMENTATION.md#8-reproduction-entry-audit).
+
 ---
 
 ## 2. Cross-scale + cross-architecture (all models)
@@ -224,6 +229,12 @@ checkpoints of a run family (default `gpt2-small`, the Stanford-CRFM Mistral run
 python emergence_dynamics_analysis.py --mode all --run-family gpt2-small --output-dir results/e3_emergence_gpt2-small
 ```
 
+Real Hugging Face forwards through NNsight:
+
+```bash
+python emergence_dynamics_analysis.py --mode all --engine nnsight --run-family gpt2-small --skip-existing --purge-cache --output-dir results/e3_emergence_gpt2-small_nnsight
+```
+
 E3's random seed is the single `--data-seed` flag (the data-resample seed), not the
 multi-seed `--seeds` used elsewhere. To sweep seeds `0,1,2`, run it three times into
 separate output directories:
@@ -255,6 +266,10 @@ full account.
 python ../common/residual_sink_analysis.py --mode all --model-name gpt2 --seeds 0,1,2 --output-dir results/e4_residual_sink_gpt2
 ```
 
+```bash
+python ../common/residual_sink_analysis.py --mode all --engine nnsight --model-name gpt2 --seeds 0,1,2 --with-perplexity --output-dir results/e4_residual_sink_gpt2_nnsight
+```
+
 Add `--with-perplexity` to include the optional functional-cost (LM cross-entropy) table.
 Every figure is regenerable from cached per-seed outputs with `--plot-only`.
 
@@ -277,5 +292,20 @@ interpretation.
 python evaluation_robustness_analysis.py --mode all --model-name gpt2 --seeds 0,1,2 --output-dir results/e5_eval_robustness_gpt2
 ```
 
+```bash
+python evaluation_robustness_analysis.py --mode all --engine nnsight --model-name gpt2 --seeds 0,1,2 --output-dir results/e5_eval_robustness_gpt2_nnsight
+```
+
 Rebuild every aggregate table and figure without loading the model/data with `--plot-only`.
-Offline checks: `--smoke-test` (random-model, no download) and `--verify-parity`.
+The legacy `--smoke-test` is the manual random-model check; the real NNsight offline checks
+use the local-model scripts below. `--verify-parity` compares manual execution with NNsight.
+
+For the offline local-model smoke suite, real-model parity commands, cache/provenance rules,
+and implementation details, see
+[`docs/NNsight_E3_E4_E5_IMPLEMENTATION.md`](docs/NNsight_E3_E4_E5_IMPLEMENTATION.md).
+On Windows, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_nnsight_rest_smoke_tests.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\run_nnsight_rest_parity.ps1
+```
