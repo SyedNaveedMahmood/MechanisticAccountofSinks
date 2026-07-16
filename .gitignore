@@ -6,3 +6,6 @@ results/
 /cross_scale_and_architecture/results/
 /cross_scale_and_architecture/logs/
 /MechanisticAccountofSinks-venv/
+/results_e3/
+/results_gpt2-medium_e4/
+/results_gpt2_e4/
