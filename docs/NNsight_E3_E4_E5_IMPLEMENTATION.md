@@ -111,7 +111,12 @@ NNsight supports `dose_response`, `decomposition`, `combined`, `surgical`, `relo
 
 `--verify-parity` runs every E4 mode on the same sample and writes `parity_report.json`.
 The report covers dose rows, decomposition arrays, combined/surgical rows, relocation values,
-and CE. NNsight/HF is the reference.
+and CE. NNsight/HF is the reference. Every row uses the requested `--parity-atol` and
+`--parity-rtol`, except `decomposition/share_delta`, whose relative tolerance is
+`max(--parity-rtol, 5e-4)` while preserving the requested absolute tolerance. The report
+records the actual tolerances on every row. This narrow floor reflects that `share_delta` is
+a derived ratio and showed a maximum observed relative discrepancy of about `2.95e-4` between
+mathematically equivalent manual and Hugging Face/NNsight execution.
 
 Existing CSV, JSON, and NPZ outputs are unchanged. Mode-specific `run_config_<mode>.json`
 files are additive and make cache validation possible.
