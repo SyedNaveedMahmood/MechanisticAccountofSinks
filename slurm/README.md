@@ -7,7 +7,7 @@ These files submit the exact commands specified by the sink-inheritance pilot do
 | File | Queue | Limit | Purpose |
 | --- | --- | ---: | --- |
 | `pilot_smoke.sbatch` | `dev_gpu_h100` | 30 minutes | Imports, model loading, path validation, and a tiny pilot run. |
-| `pilot_run.sbatch` | `gpu_h100` | 24 hours | One production pilot command on one H100 GPU. |
+| `pilot_run.sbatch` | `gpu_h100` | 12 hours | One production pilot command using one H100 GPU and eight CPU cores. |
 | `pilot_common.sh` | n/a | n/a | Conda, workspace, caches, metadata, CUDA validation, and result paths. |
 | `submit_pilot.sh` | n/a | n/a | Quotes and exports the exact pilot command, creates `logs/`, and submits the selected job. |
 
@@ -59,7 +59,7 @@ The wrapper shell-quotes every argument before exporting it as `PILOT_CMD`; the 
 Use an A100 or a longer wall time without editing committed files:
 
 ```bash
-SBATCH_ARGS='--partition=gpu_a100_il --time=48:00:00' \
+SBATCH_ARGS='--partition=gpu_a100_il --time=24:00:00' \
   bash slurm/submit_pilot.sh full -- \
   python path/to/pilot_entrypoint.py --config path/to/pilot_config.yaml
 ```
